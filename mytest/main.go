@@ -1131,12 +1131,15 @@ func handler(rawEvt interface{}) {
 	case *events.Presence:
 		if evt.Unavailable {
 			if evt.LastSeen.IsZero() {
-				log.Infof("%s is now offline", evt.From)
+				//log.Infof("%s is now offline", evt.From)
+				log.Infof("offline: %s", evt.From)
 			} else {
-				log.Infof("%s is now offline (last seen: %s)", evt.From, evt.LastSeen)
+				//log.Infof("%s is now offline (last seen: %s)", evt.From, evt.LastSeen)
+				log.Infof("offline: %s", evt.From, evt.LastSeen)
 			}
 		} else {
-			log.Infof("%s is now online", evt.From)
+			//log.Infof("%s is now online", evt.From)
+			log.Infof("online: %s", evt.From)
 		}
 	case *events.HistorySync:
 		id := atomic.AddInt32(&historySyncID, 1)
