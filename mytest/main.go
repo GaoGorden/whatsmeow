@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"mime"
@@ -24,7 +23,6 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/mdp/qrterminal/v3"
 	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow"
@@ -97,24 +95,24 @@ func main() {
 		return true
 	}
 
-	ch, err := cli.GetQRChannel(context.Background())
-	if err != nil {
-		// This error means that we're already logged in, so ignore it.
-		if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
-			log.Errorf("Failed to get QR channel: %v", err)
-		}
-	} else {
-		go func() {
-			for evt := range ch {
-				if evt.Event == "code" {
-					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-					log.Infof("qrcode: $%s$", evt.Code)
-				} else {
-					log.Infof("QR channel result: %s", evt.Event)
-				}
-			}
-		}()
-	}
+	//ch, err := cli.GetQRChannel(context.Background())
+	//if err != nil {
+	//	// This error means that we're already logged in, so ignore it.
+	//	if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
+	//		log.Errorf("Failed to get QR channel: %v", err)
+	//	}
+	//} else {
+	//	go func() {
+	//		for evt := range ch {
+	//			if evt.Event == "code" {
+	//				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+	//				log.Infof("qrcode: $%s$", evt.Code)
+	//			} else {
+	//				log.Infof("QR channel result: %s", evt.Event)
+	//			}
+	//		}
+	//	}()
+	//}
 
 	cli.AddEventHandler(handler)
 	err = cli.Connect()
