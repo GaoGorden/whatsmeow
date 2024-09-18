@@ -121,6 +121,8 @@ func main() {
 		return
 	}
 
+	log.Infof("Client is ready")
+
 	c := make(chan os.Signal, 1)
 	input := make(chan string)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
