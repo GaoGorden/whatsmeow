@@ -496,7 +496,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Failed to get avatar: %s", jid)
 		} else if pic != nil {
 			//log.Infof("Got avatar ID %s: %s", pic.ID, pic.URL)
-			log.Infof("Got avatar success %s: %s", jid, pic.URL)
+			log.Infof("Got avatar success %s: %sAVATAREND", jid, pic.URL)
 		} else {
 			log.Infof("No avatar found")
 		}
