@@ -7,6 +7,7 @@
 package whatsmeow
 
 import (
+	"context"
 	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -101,14 +102,12 @@ func (cli *Client) handleConnectFailure(node *waBinary.Node) {
 		// By default, expect a disconnect (i.e. prevent auto-reconnect)
 		cli.expectDisconnect()
 		willAutoReconnect = false
-	case reason == events.ConnectFailureServiceUnavailable:
+	case reason == events.ConnectFailureServiceUnavailable || reason == events.ConnectFailureInternalServerError:
 		// Auto-reconnect for 503s
 	case reason == events.ConnectFailureCATInvalid || reason == events.ConnectFailureCATExpired:
 		// Auto-reconnect when rotating CAT, lock socket to ensure refresh goes through before reconnect
 		cli.socketLock.RLock()
 		defer cli.socketLock.RUnlock()
-	case reason == 500 && message == "biz vname fetch error":
-		// These happen for business accounts randomly, also auto-reconnect
 	}
 	if reason == 403 {
 		cli.Log.Debugf(
@@ -154,6 +153,17 @@ func (cli *Client) handleConnectSuccess(node *waBinary.Node) {
 	cli.LastSuccessfulConnect = time.Now()
 	cli.AutoReconnectErrors = 0
 	cli.isLoggedIn.Store(true)
+	nodeLID := node.AttrGetter().JID("lid")
+	if cli.Store.LID.IsEmpty() && !nodeLID.IsEmpty() {
+		cli.Store.LID = nodeLID
+		err := cli.Store.Save()
+		if err != nil {
+			cli.Log.Warnf("Failed to save device after updating LID: %v", err)
+		} else {
+			cli.Log.Infof("Updated LID to %s", cli.Store.LID)
+		}
+		cli.StoreLIDPNMapping(context.TODO(), cli.Store.GetLID(), cli.Store.GetJID())
+	}
 	go func() {
 		if dbCount, err := cli.Store.PreKeys.UploadedPreKeyCount(); err != nil {
 			cli.Log.Errorf("Failed to get number of prekeys in database: %v", err)

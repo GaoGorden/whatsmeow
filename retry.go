@@ -21,9 +21,9 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
-	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waConsumerApplication"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waMsgApplication"
 	"go.mau.fi/whatsmeow/proto/waMsgTransport"
 	"go.mau.fi/whatsmeow/types"
@@ -39,7 +39,7 @@ type recentMessageKey struct {
 }
 
 type RecentMessage struct {
-	wa *waProto.Message
+	wa *waE2E.Message
 	fb *waMsgApplication.MessageApplication
 }
 
@@ -47,7 +47,7 @@ func (rm RecentMessage) IsEmpty() bool {
 	return rm.wa == nil && rm.fb == nil
 }
 
-func (cli *Client) addRecentMessage(to types.JID, id types.MessageID, wa *waProto.Message, fb *waMsgApplication.MessageApplication) {
+func (cli *Client) addRecentMessage(to types.JID, id types.MessageID, wa *waE2E.Message, fb *waMsgApplication.MessageApplication) {
 	cli.recentMessagesLock.Lock()
 	key := recentMessageKey{to, id}
 	if cli.recentMessagesList[cli.recentMessagesPtr].ID != "" {
@@ -147,22 +147,17 @@ func (cli *Client) handleRetryReceipt(receipt *events.Receipt, node *waBinary.No
 		return nil
 	}
 
-	ownID := cli.getOwnID()
-	if ownID.IsEmpty() {
-		return ErrNotLoggedIn
-	}
-
 	var fbSKDM *waMsgTransport.MessageTransport_Protocol_Ancillary_SenderKeyDistributionMessage
 	var fbDSM *waMsgTransport.MessageTransport_Protocol_Integral_DeviceSentMessage
 	if receipt.IsGroup {
 		builder := groups.NewGroupSessionBuilder(cli.Store, pbSerializer)
-		senderKeyName := protocol.NewSenderKeyName(receipt.Chat.String(), ownID.SignalAddress())
+		senderKeyName := protocol.NewSenderKeyName(receipt.Chat.String(), cli.getOwnLID().SignalAddress())
 		signalSKDMessage, err := builder.Create(senderKeyName)
 		if err != nil {
 			cli.Log.Warnf("Failed to create sender key distribution message to include in retry of %s in %s to %s: %v", messageID, receipt.Chat, receipt.Sender, err)
 		}
 		if msg.wa != nil {
-			msg.wa.SenderKeyDistributionMessage = &waProto.SenderKeyDistributionMessage{
+			msg.wa.SenderKeyDistributionMessage = &waE2E.SenderKeyDistributionMessage{
 				GroupID:                             proto.String(receipt.Chat.String()),
 				AxolotlSenderKeyDistributionMessage: signalSKDMessage.Serialize(),
 			}
@@ -174,8 +169,8 @@ func (cli *Client) handleRetryReceipt(receipt *events.Receipt, node *waBinary.No
 		}
 	} else if receipt.IsFromMe {
 		if msg.wa != nil {
-			msg.wa = &waProto.Message{
-				DeviceSentMessage: &waProto.DeviceSentMessage{
+			msg.wa = &waE2E.Message{
+				DeviceSentMessage: &waE2E.DeviceSentMessage{
 					DestinationJID: proto.String(receipt.Chat.String()),
 					Message:        msg.wa,
 				},
@@ -245,7 +240,17 @@ func (cli *Client) handleRetryReceipt(receipt *events.Receipt, node *waBinary.No
 	var encrypted *waBinary.Node
 	var includeDeviceIdentity bool
 	if msg.wa != nil {
-		encrypted, includeDeviceIdentity, err = cli.encryptMessageForDevice(plaintext, receipt.Sender, bundle, encAttrs)
+		encryptionIdentity := receipt.Sender
+		if receipt.Sender.Server == types.DefaultUserServer {
+			lidForPN, err := cli.Store.LIDs.GetLIDForPN(context.TODO(), receipt.Sender)
+			if err != nil {
+				cli.Log.Warnf("Failed to get LID for %s: %v", receipt.Sender, err)
+			} else if !lidForPN.IsEmpty() {
+				cli.migrateSessionStore(receipt.Sender, lidForPN)
+				encryptionIdentity = lidForPN
+			}
+		}
+		encrypted, includeDeviceIdentity, err = cli.encryptMessageForDevice(plaintext, encryptionIdentity, bundle, encAttrs)
 	} else {
 		encrypted, err = cli.encryptMessageForDeviceV3(&waMsgTransport.MessageTransport_Payload{
 			ApplicationPayload: &waCommon.SubProtocol{
@@ -280,7 +285,9 @@ func (cli *Client) handleRetryReceipt(receipt *events.Receipt, node *waBinary.No
 	}
 	var content []waBinary.Node
 	if msg.wa != nil {
-		content = cli.getMessageContent(*encrypted, msg.wa, attrs, includeDeviceIdentity, nil)
+		content = cli.getMessageContent(
+			*encrypted, msg.wa, attrs, includeDeviceIdentity, nodeExtraParams{},
+		)
 	} else {
 		content = []waBinary.Node{
 			*encrypted,
@@ -351,6 +358,14 @@ func (cli *Client) delayedRequestMessageFromPhone(info *types.MessageInfo) {
 		cli.Log.Warnf("Failed to send request for unavailable message %s to phone: %v", info.ID, err)
 	} else {
 		cli.Log.Debugf("Requested message %s from phone", info.ID)
+	}
+}
+
+func (cli *Client) clearDelayedMessageRequests() {
+	cli.pendingPhoneRerequestsLock.Lock()
+	defer cli.pendingPhoneRerequestsLock.Unlock()
+	for _, cancel := range cli.pendingPhoneRerequests {
+		cancel()
 	}
 }
 
