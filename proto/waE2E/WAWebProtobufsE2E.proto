@@ -47,6 +47,10 @@ enum BotMetricsEntryPoint {
 	AI_HOME = 19;
 	AI_DEEPLINK_IMMERSIVE = 20;
 	AI_DEEPLINK = 21;
+	META_AI_CHAT_SHORTCUT_AI_STUDIO = 22;
+	UGC_CHAT_SHORTCUT_AI_STUDIO = 23;
+	NEW_CHAT_AI_STUDIO = 24;
+	AIVOICE_FAVICON_CALL_HISTORY = 25;
 }
 
 enum BotMetricsThreadEntryPoint {
@@ -298,6 +302,7 @@ message SecretEncryptedMessage {
 	enum SecretEncType {
 		UNKNOWN = 0;
 		EVENT_EDIT = 1;
+		MESSAGE_EDIT = 2;
 	}
 
 	optional WACommon.MessageKey targetMessageKey = 1;
@@ -510,6 +515,7 @@ message OrderMessage {
 	optional ContextInfo contextInfo = 17;
 	optional int32 messageVersion = 12;
 	optional WACommon.MessageKey orderRequestMessageID = 13;
+	optional string catalogType = 15;
 }
 
 message PaymentInviteMessage {
@@ -756,15 +762,22 @@ message CloudAPIThreadControlNotification {
 		CONTROL_TAKEN = 2;
 	}
 
+	message CloudAPIThreadControlNotificationContent {
+		optional string handoffNotificationText = 1;
+		optional string extraJSON = 2;
+	}
+
 	optional CloudAPIThreadControl status = 1;
 	optional int64 senderNotificationTimestampMS = 2;
 	optional string consumerLid = 3;
 	optional string consumerPhoneNumber = 4;
+	optional CloudAPIThreadControlNotificationContent notificationContent = 5;
 }
 
 message BotFeedbackMessage {
 	enum ReportKind {
-		GENERIC = 0;
+		NONE = 0;
+		GENERIC = 1;
 	}
 
 	enum BotFeedbackKindMultiplePositive {
@@ -797,6 +810,8 @@ message BotFeedbackMessage {
 		BOT_FEEDBACK_NEGATIVE_PERSONALIZED = 10;
 		BOT_FEEDBACK_NEGATIVE_CLARITY = 11;
 		BOT_FEEDBACK_NEGATIVE_DOESNT_LOOK_LIKE_THE_PERSON = 12;
+		BOT_FEEDBACK_NEGATIVE_HALLUCINATION_INTERNAL_ONLY = 13;
+		BOT_FEEDBACK_NEGATIVE = 14;
 	}
 
 	optional WACommon.MessageKey messageKey = 1;
@@ -989,12 +1004,23 @@ message ImageMessage {
 }
 
 message ContextInfo {
+	enum StatusSourceType {
+		IMAGE = 0;
+		VIDEO = 1;
+		GIF = 2;
+		AUDIO = 3;
+		TEXT = 4;
+		MUSIC_STANDALONE = 5;
+	}
+
 	enum PairedMediaType {
 		NOT_PAIRED_MEDIA = 0;
 		SD_VIDEO_PARENT = 1;
 		HD_VIDEO_CHILD = 2;
 		SD_IMAGE_PARENT = 3;
 		HD_IMAGE_CHILD = 4;
+		MOTION_PHOTO_PARENT = 5;
+		MOTION_PHOTO_CHILD = 6;
 	}
 
 	enum StatusAttributionType {
@@ -1151,6 +1177,7 @@ message ContextInfo {
 	optional uint32 rankingVersion = 60;
 	optional MemberLabel memberLabel = 62;
 	optional bool isQuestion = 63;
+	optional StatusSourceType statusSourceType = 64;
 }
 
 message BotPluginMetadata {
@@ -1516,6 +1543,30 @@ message BotCapabilityMetadata {
 	repeated BotCapabilityType capabilities = 1;
 }
 
+message BotModeSelectionMetadata {
+	enum BotUserSelectionMode {
+		UNKNOWN_MODE = 0;
+		REASONING_MODE = 1;
+	}
+
+	repeated BotUserSelectionMode mode = 1;
+}
+
+message BotQuotaMetadata {
+	message BotFeatureQuotaMetadata {
+		enum BotFeatureType {
+			UNKNOWN_FEATURE = 0;
+			REASONING_FEATURE = 1;
+		}
+
+		optional BotFeatureType featureType = 1;
+		optional uint32 remainingQuota = 2;
+		optional uint64 expirationTimestamp = 3;
+	}
+
+	repeated BotFeatureQuotaMetadata botFeatureQuotaMetadata = 1;
+}
+
 message BotImagineMetadata {
 	enum ImagineType {
 		UNKNOWN = 0;
@@ -1572,6 +1623,16 @@ message MessageAssociation {
 	optional int32 messageIndex = 3;
 }
 
+message ThreadID {
+	enum ThreadType {
+		UNKNOWN = 0;
+		VIEW_REPLIES = 1;
+	}
+
+	optional ThreadType threadType = 1;
+	optional WACommon.MessageKey threadKey = 2;
+}
+
 message MessageContextInfo {
 	enum MessageAddonExpiryType {
 		STATIC = 1;
@@ -1592,6 +1653,7 @@ message MessageContextInfo {
 	optional string supportPayload = 12;
 	optional WACommon.LimitSharing limitSharing = 13;
 	optional WACommon.LimitSharing limitSharingV2 = 14;
+	repeated ThreadID threadID = 15;
 }
 
 message InteractiveAnnotation {
@@ -1800,6 +1862,7 @@ message Message {
 	optional FutureProofMessage limitSharingMessage = 99;
 	optional FutureProofMessage botTaskMessage = 100;
 	optional FutureProofMessage questionMessage = 101;
+	optional MessageHistoryNotice messageHistoryNotice = 102;
 }
 
 message AlbumMessage {
@@ -2090,7 +2153,7 @@ message InitialSecurityNotificationSettingSync {
 
 message PeerDataOperationRequestMessage {
 	message SyncDCollectionFatalRecoveryRequest {
-		repeated string collectionNames = 1;
+		optional string collectionName = 1;
 		optional int64 timestamp = 2;
 	}
 
@@ -2180,6 +2243,7 @@ message Call {
 	optional uint32 conversionDelaySeconds = 4;
 	optional string ctwaSignals = 5;
 	optional bytes ctwaPayload = 6;
+	optional ContextInfo contextInfo = 7;
 }
 
 message AudioMessage {
@@ -2336,6 +2400,11 @@ message BotMemuMetadata {
 	repeated BotMediaMetadata faceImages = 1;
 }
 
+message BotAgeCollectionMetadata {
+	optional bool ageCollectionEligible = 1;
+	optional bool shouldTriggerAgeCollectionOnClient = 2;
+}
+
 message BotMetadata {
 	optional BotAvatarMetadata avatarMetadata = 1;
 	optional string personaID = 2;
@@ -2358,6 +2427,9 @@ message BotMetadata {
 	optional BotSourcesMetadata richResponseSourcesMetadata = 19;
 	optional bytes aiConversationContext = 20;
 	optional BotPromotionMessageMetadata botPromotionMessageMetadata = 21;
+	optional BotModeSelectionMetadata botModeSelectionMetadata = 22;
+	optional BotQuotaMetadata botQuotaMetadata = 23;
+	optional BotAgeCollectionMetadata botAgeCollectionMetadata = 24;
 }
 
 message DeviceListMetadata {

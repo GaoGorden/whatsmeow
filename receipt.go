@@ -7,6 +7,7 @@
 package whatsmeow
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -16,14 +17,14 @@ import (
 )
 
 func (cli *Client) handleReceipt(node *waBinary.Node) {
-	defer cli.maybeDeferredAck(node)()
+	defer cli.maybeDeferredAck(cli.BackgroundEventCtx, node)()
 	receipt, err := cli.parseReceipt(node)
 	if err != nil {
 		cli.Log.Warnf("Failed to parse receipt: %v", err)
 	} else if receipt != nil {
 		if receipt.Type == types.ReceiptTypeRetry {
 			go func() {
-				err := cli.handleRetryReceipt(receipt, node)
+				err := cli.handleRetryReceipt(cli.BackgroundEventCtx, receipt, node)
 				if err != nil {
 					cli.Log.Errorf("Failed to handle retry receipt for %s/%s from %s: %v", receipt.Chat, receipt.MessageIDs[0], receipt.Sender, err)
 				}
@@ -96,9 +97,12 @@ func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, error) {
 	return &receipt, nil
 }
 
-func (cli *Client) maybeDeferredAck(node *waBinary.Node) func() {
+func (cli *Client) maybeDeferredAck(ctx context.Context, node *waBinary.Node) func() {
 	if cli.SynchronousAck {
 		return func() {
+			if ctx.Err() != nil {
+				return
+			}
 			cli.sendAck(node)
 		}
 	} else {
@@ -169,7 +173,7 @@ func (cli *Client) MarkRead(ids []types.MessageID, timestamp time.Time, chat, se
 			"t":    timestamp.Unix(),
 		},
 	}
-	if chat.Server == types.NewsletterServer || cli.GetPrivacySettings().ReadReceipts == types.PrivacySettingNone {
+	if chat.Server == types.NewsletterServer || cli.GetPrivacySettings(context.TODO()).ReadReceipts == types.PrivacySettingNone {
 		switch receiptType {
 		case types.ReceiptTypeRead:
 			node.Attrs["type"] = string(types.ReceiptTypeReadSelf)
