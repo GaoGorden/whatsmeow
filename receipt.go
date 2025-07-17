@@ -11,13 +11,17 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/rs/zerolog"
+	"go.mau.fi/util/ptr"
+
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
 
 func (cli *Client) handleReceipt(node *waBinary.Node) {
-	defer cli.maybeDeferredAck(cli.BackgroundEventCtx, node)()
+	var cancelled bool
+	defer cli.maybeDeferredAck(cli.BackgroundEventCtx, node)(&cancelled)
 	receipt, err := cli.parseReceipt(node)
 	if err != nil {
 		cli.Log.Warnf("Failed to parse receipt: %v", err)
@@ -30,7 +34,7 @@ func (cli *Client) handleReceipt(node *waBinary.Node) {
 				}
 			}()
 		}
-		cli.dispatchEvent(receipt)
+		cancelled = cli.dispatchEvent(receipt)
 	}
 }
 
@@ -50,7 +54,7 @@ func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participa
 			cli.Log.Warnf("Failed to parse user node %s in grouped receipt: %v", child.XMLString(), ag.Error())
 			continue
 		}
-		go cli.dispatchEvent(&receipt)
+		cli.dispatchEvent(&receipt)
 	}
 }
 
@@ -97,17 +101,23 @@ func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, error) {
 	return &receipt, nil
 }
 
-func (cli *Client) maybeDeferredAck(ctx context.Context, node *waBinary.Node) func() {
+func (cli *Client) maybeDeferredAck(ctx context.Context, node *waBinary.Node) func(cancelled ...*bool) {
 	if cli.SynchronousAck {
-		return func() {
-			if ctx.Err() != nil {
+		return func(cancelled ...*bool) {
+			isCancelled := len(cancelled) > 0 && ptr.Val(cancelled[0])
+			if ctx.Err() != nil || isCancelled {
+				zerolog.Ctx(ctx).Debug().
+					AnErr("ctx_err", ctx.Err()).
+					Bool("cancelled", isCancelled).
+					Str("node_tag", node.Tag).
+					Msg("Not sending ack for node")
 				return
 			}
 			cli.sendAck(node)
 		}
 	} else {
 		go cli.sendAck(node)
-		return func() {}
+		return func(...*bool) {}
 	}
 }
 

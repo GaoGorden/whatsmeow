@@ -40,12 +40,13 @@ import (
 
 // EventHandler is a function that can handle events from WhatsApp.
 type EventHandler func(evt any)
+type EventHandlerWithSuccessStatus func(evt any) bool
 type nodeHandler func(node *waBinary.Node)
 
 var nextHandlerID uint32
 
 type wrappedEventHandler struct {
-	fn EventHandler
+	fn EventHandlerWithSuccessStatus
 	id uint32
 }
 
@@ -181,7 +182,7 @@ type Client struct {
 	// separate library for all the non-e2ee-related stuff like logging in.
 	// The library is currently embedded in mautrix-meta (https://github.com/mautrix/meta), but may be separated later.
 	MessengerConfig *MessengerConfig
-	RefreshCAT      func() error
+	RefreshCAT      func(context.Context) error
 }
 
 type groupMetaCache struct {
@@ -445,7 +446,7 @@ func (cli *Client) Connect() error {
 
 	err := cli.unlockedConnect()
 	if exhttp.IsNetworkError(err) && cli.InitialAutoReconnect && cli.EnableAutoReconnect {
-		cli.Log.Errorf("Initial connection failed but reconnecting in background")
+		cli.Log.Errorf("Initial connection failed but reconnecting in background (%v)", err)
 		go cli.dispatchEvent(&events.Disconnected{})
 		go cli.autoReconnect()
 		return nil
@@ -683,6 +684,13 @@ func (cli *Client) Logout(ctx context.Context) error {
 //		// Handle event and access mycli.WAClient
 //	}
 func (cli *Client) AddEventHandler(handler EventHandler) uint32 {
+	return cli.AddEventHandlerWithSuccessStatus(func(evt any) bool {
+		handler(evt)
+		return true
+	})
+}
+
+func (cli *Client) AddEventHandlerWithSuccessStatus(handler EventHandlerWithSuccessStatus) uint32 {
 	nextID := atomic.AddUint32(&nextHandlerID, 1)
 	cli.eventHandlersLock.Lock()
 	cli.eventHandlers = append(cli.eventHandlers, wrappedEventHandler{handler, nextID})
@@ -829,7 +837,7 @@ func (cli *Client) sendNode(node waBinary.Node) error {
 	return err
 }
 
-func (cli *Client) dispatchEvent(evt any) {
+func (cli *Client) dispatchEvent(evt any) (handlerFailed bool) {
 	cli.eventHandlersLock.RLock()
 	defer func() {
 		cli.eventHandlersLock.RUnlock()
@@ -839,8 +847,11 @@ func (cli *Client) dispatchEvent(evt any) {
 		}
 	}()
 	for _, handler := range cli.eventHandlers {
-		handler.fn(evt)
+		if !handler.fn(evt) {
+			return true
+		}
 	}
+	return false
 }
 
 // ParseWebMessage parses a WebMessageInfo object into *events.Message to match what real-time messages have.
