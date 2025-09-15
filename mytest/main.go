@@ -559,7 +559,7 @@ func handleCmd(cmd string, args []string) {
 			log.Infof("Community participants: %+v", resp)
 		}
 	case "listgroups":
-		groups, err := cli.GetJoinedGroups()
+		groups, err := cli.GetJoinedGroups(ctx)
 		if err != nil {
 			log.Errorf("Failed to get group list: %v", err)
 		} else {
@@ -700,7 +700,7 @@ func handleCmd(cmd string, args []string) {
 		if !ok {
 			return
 		}
-		err = cli.SetDisappearingTimer(recipient, time.Duration(days)*24*time.Hour)
+		err = cli.SetDisappearingTimer(recipient, time.Duration(days)*24*time.Hour, time.Now())
 		if err != nil {
 			log.Errorf("Failed to set disappearing timer: %v", err)
 		}
