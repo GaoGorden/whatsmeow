@@ -1134,17 +1134,28 @@ func handler(rawEvt interface{}) {
 			log.Infof("%s was delivered to %s at %s", evt.MessageIDs[0], evt.SourceString(), evt.Timestamp)
 		}
 	case *events.Presence:
+		var result = ""
+		pnForLID, err := cli.Store.LIDs.GetPNForLID(ctx, evt.From)
+		if err != nil {
+			cli.Log.Warnf("Failed to get LID for %s: %v", evt.From, err)
+			result = evt.From.String()
+		} else if !pnForLID.IsEmpty() {
+			result = pnForLID.String()
+		} else {
+			result = evt.From.String()
+		}
+
 		if evt.Unavailable {
 			if evt.LastSeen.IsZero() {
 				//log.Infof("%s is now offline", evt.From)
-				log.Infof("offline: %s", evt.From)
+				log.Infof("offline: %s", result)
 			} else {
 				//log.Infof("%s is now offline (last seen: %s)", evt.From, evt.LastSeen)
-				log.Infof("offline: %s", evt.From, evt.LastSeen)
+				log.Infof("offline: %s", result, evt.LastSeen)
 			}
 		} else {
 			//log.Infof("%s is now online", evt.From)
-			log.Infof("online: %s", evt.From)
+			log.Infof("online: %s", result)
 		}
 	case *events.HistorySync:
 		id := atomic.AddInt32(&historySyncID, 1)
