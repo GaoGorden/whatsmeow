@@ -267,7 +267,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: checkuser <phone numbers...>")
 			return
 		}
-		resp, err := cli.IsOnWhatsApp(args)
+		resp, err := cli.IsOnWhatsApp(ctx, args)
 		if err != nil {
 			log.Errorf("Failed to check if users are on WhatsApp:", err)
 		} else {
@@ -302,7 +302,7 @@ func handleCmd(cmd string, args []string) {
 		if !ok {
 			return
 		}
-		err := cli.SubscribePresence(jid)
+		err := cli.SubscribePresence(ctx, jid)
 		if err != nil {
 			fmt.Println(err)
 		}
@@ -311,7 +311,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: presence <available/unavailable>")
 			return
 		}
-		fmt.Println(cli.SendPresence(types.Presence(args[0])))
+		fmt.Println(cli.SendPresence(ctx, types.Presence(args[0])))
 	case "chatpresence":
 		if len(args) == 2 {
 			args = append(args, "")
@@ -320,7 +320,7 @@ func handleCmd(cmd string, args []string) {
 			return
 		}
 		jid, _ := types.ParseJID(args[0])
-		fmt.Println(cli.SendChatPresence(jid, types.ChatPresence(args[1]), types.ChatPresenceMedia(args[2])))
+		fmt.Println(cli.SendChatPresence(ctx, jid, types.ChatPresence(args[1]), types.ChatPresenceMedia(args[2])))
 	case "privacysettings":
 		resp, err := cli.TryFetchPrivacySettings(ctx, false)
 		if err != nil {
@@ -354,7 +354,7 @@ func handleCmd(cmd string, args []string) {
 			}
 			jids = append(jids, jid)
 		}
-		resp, err := cli.GetUserInfo(jids)
+		resp, err := cli.GetUserInfo(ctx, jids)
 		if err != nil {
 			log.Errorf("Failed to get user info: %v", err)
 		} else {
@@ -373,13 +373,13 @@ func handleCmd(cmd string, args []string) {
 		var node waBinary.Node
 		if err := json.Unmarshal([]byte(strings.Join(args, " ")), &node); err != nil {
 			log.Errorf("Failed to parse args as JSON into XML node: %v", err)
-		} else if err = cli.DangerousInternals().SendNode(node); err != nil {
+		} else if err = cli.DangerousInternals().SendNode(ctx, node); err != nil {
 			log.Errorf("Error sending node: %v", err)
 		} else {
 			log.Infof("Node sent")
 		}
 	case "listnewsletters":
-		newsletters, err := cli.GetSubscribedNewsletters()
+		newsletters, err := cli.GetSubscribedNewsletters(ctx)
 		if err != nil {
 			log.Errorf("Failed to get subscribed newsletters: %v", err)
 			return
@@ -392,14 +392,14 @@ func handleCmd(cmd string, args []string) {
 		if !ok {
 			return
 		}
-		meta, err := cli.GetNewsletterInfo(jid)
+		meta, err := cli.GetNewsletterInfo(ctx, jid)
 		if err != nil {
 			log.Errorf("Failed to get info: %v", err)
 		} else {
 			log.Infof("Got info: %+v", meta)
 		}
 	case "getnewsletterinvite":
-		meta, err := cli.GetNewsletterInfoWithInvite(args[0])
+		meta, err := cli.GetNewsletterInfoWithInvite(ctx, args[0])
 		if err != nil {
 			log.Errorf("Failed to get info: %v", err)
 		} else {
@@ -446,7 +446,7 @@ func handleCmd(cmd string, args []string) {
 				return
 			}
 		}
-		messages, err := cli.GetNewsletterMessages(jid, &whatsmeow.GetNewsletterMessagesParams{Count: count, Before: before})
+		messages, err := cli.GetNewsletterMessages(ctx, jid, &whatsmeow.GetNewsletterMessagesParams{Count: count, Before: before})
 		if err != nil {
 			log.Errorf("Failed to get messages: %v", err)
 		} else {
@@ -459,7 +459,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: createnewsletter <name>")
 			return
 		}
-		resp, err := cli.CreateNewsletter(whatsmeow.CreateNewsletterParams{
+		resp, err := cli.CreateNewsletter(ctx, whatsmeow.CreateNewsletterParams{
 			Name: strings.Join(args, " "),
 		})
 		if err != nil {
@@ -488,7 +488,7 @@ func handleCmd(cmd string, args []string) {
 				isCommunity = true
 			}
 		}
-		pic, err := cli.GetProfilePictureInfo(jid, &whatsmeow.GetProfilePictureParams{
+		pic, err := cli.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{
 			Preview:     preview,
 			IsCommunity: isCommunity,
 			ExistingID:  existingID,
@@ -514,7 +514,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Input must be a group JID (@%s)", types.GroupServer)
 			return
 		}
-		resp, err := cli.GetGroupInfo(group)
+		resp, err := cli.GetGroupInfo(ctx, group)
 		if err != nil {
 			log.Errorf("Failed to get group info: %v", err)
 		} else {
@@ -532,7 +532,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Input must be a group JID (@%s)", types.GroupServer)
 			return
 		}
-		resp, err := cli.GetSubGroups(group)
+		resp, err := cli.GetSubGroups(ctx, group)
 		if err != nil {
 			log.Errorf("Failed to get subgroups: %v", err)
 		} else {
@@ -552,7 +552,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Input must be a group JID (@%s)", types.GroupServer)
 			return
 		}
-		resp, err := cli.GetLinkedGroupsParticipants(group)
+		resp, err := cli.GetLinkedGroupsParticipants(ctx, group)
 		if err != nil {
 			log.Errorf("Failed to get community participants: %v", err)
 		} else {
@@ -579,7 +579,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Input must be a group JID (@%s)", types.GroupServer)
 			return
 		}
-		resp, err := cli.GetGroupInviteLink(group, len(args) > 1 && args[1] == "--reset")
+		resp, err := cli.GetGroupInviteLink(ctx, group, len(args) > 1 && args[1] == "--reset")
 		if err != nil {
 			log.Errorf("Failed to get group invite link: %v", err)
 		} else {
@@ -590,7 +590,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: queryinvitelink <link>")
 			return
 		}
-		resp, err := cli.GetGroupInfoFromLink(args[0])
+		resp, err := cli.GetGroupInfoFromLink(ctx, args[0])
 		if err != nil {
 			log.Errorf("Failed to resolve group invite link: %v", err)
 		} else {
@@ -601,7 +601,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: querybusinesslink <link>")
 			return
 		}
-		resp, err := cli.ResolveBusinessMessageLink(args[0])
+		resp, err := cli.ResolveBusinessMessageLink(ctx, args[0])
 		if err != nil {
 			log.Errorf("Failed to resolve business message link: %v", err)
 		} else {
@@ -612,7 +612,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: acceptinvitelink <link>")
 			return
 		}
-		groupID, err := cli.JoinGroupWithLink(args[0])
+		groupID, err := cli.JoinGroupWithLink(ctx, args[0])
 		if err != nil {
 			log.Errorf("Failed to join group via invite link: %v", err)
 		} else {
@@ -676,14 +676,14 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Invalid JID")
 			return
 		}
-		resp, err := cli.GetGroupRequestParticipants(group)
+		resp, err := cli.GetGroupRequestParticipants(ctx, group)
 		if err != nil {
 			log.Errorf("Failed to get request participants: %v", err)
 		} else {
 			log.Infof("Request participants: %+v", resp)
 		}
 	case "getstatusprivacy":
-		resp, err := cli.GetStatusPrivacy()
+		resp, err := cli.GetStatusPrivacy(ctx)
 		fmt.Println(err)
 		fmt.Println(resp)
 	case "setdisappeartimer":
@@ -700,7 +700,7 @@ func handleCmd(cmd string, args []string) {
 		if !ok {
 			return
 		}
-		err = cli.SetDisappearingTimer(recipient, time.Duration(days)*24*time.Hour, time.Now())
+		err = cli.SetDisappearingTimer(ctx, recipient, time.Duration(days)*24*time.Hour, time.Now())
 		if err != nil {
 			log.Errorf("Failed to set disappearing timer: %v", err)
 		}
@@ -714,7 +714,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Invalid duration: %v", err)
 			return
 		}
-		err = cli.SetDefaultDisappearingTimer(time.Duration(days) * 24 * time.Hour)
+		err = cli.SetDefaultDisappearingTimer(ctx, time.Duration(days)*24*time.Hour)
 		if err != nil {
 			log.Errorf("Failed to set default disappearing timer: %v", err)
 		}
@@ -871,7 +871,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: setstatus <message>")
 			return
 		}
-		err := cli.SetStatusMessage(strings.Join(args, " "))
+		err := cli.SetStatusMessage(ctx, strings.Join(args, " "))
 		if err != nil {
 			log.Errorf("Error setting status message: %v", err)
 		} else {
@@ -935,7 +935,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Error changing chat's pin state: %v", err)
 		}
 	case "getblocklist":
-		blocklist, err := cli.GetBlocklist()
+		blocklist, err := cli.GetBlocklist(ctx)
 		if err != nil {
 			log.Errorf("Failed to get blocked contacts list: %v", err)
 		} else {
@@ -950,7 +950,7 @@ func handleCmd(cmd string, args []string) {
 		if !ok {
 			return
 		}
-		resp, err := cli.UpdateBlocklist(jid, events.BlocklistChangeActionBlock)
+		resp, err := cli.UpdateBlocklist(ctx, jid, events.BlocklistChangeActionBlock)
 		if err != nil {
 			log.Errorf("Error updating blocklist: %v", err)
 		} else {
@@ -965,7 +965,7 @@ func handleCmd(cmd string, args []string) {
 		if !ok {
 			return
 		}
-		resp, err := cli.UpdateBlocklist(jid, events.BlocklistChangeActionUnblock)
+		resp, err := cli.UpdateBlocklist(ctx, jid, events.BlocklistChangeActionUnblock)
 		if err != nil {
 			log.Errorf("Error updating blocklist: %v", err)
 		} else {
@@ -1045,7 +1045,7 @@ func handler(rawEvt interface{}) {
 	switch evt := rawEvt.(type) {
 	case *events.AppStateSyncComplete:
 		if len(cli.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
-			err := cli.SendPresence(types.PresenceAvailable)
+			err := cli.SendPresence(ctx, types.PresenceAvailable)
 			if err != nil {
 				log.Warnf("Failed to send available presence: %v", err)
 			} else {
@@ -1058,7 +1058,7 @@ func handler(rawEvt interface{}) {
 		}
 		// Send presence available when connecting and when the pushname is changed.
 		// This makes sure that outgoing messages always have the right pushname.
-		err := cli.SendPresence(types.PresenceAvailable)
+		err := cli.SendPresence(ctx, types.PresenceAvailable)
 		if err != nil {
 			log.Warnf("Failed to send available presence: %v", err)
 		} else {
@@ -1126,6 +1126,23 @@ func handler(rawEvt interface{}) {
 				return
 			}
 			log.Infof("Saved image in message to %s", path)
+		}
+
+		video := evt.Message.GetVideoMessage()
+		if video != nil {
+			data, err := cli.Download(ctx, video)
+			if err != nil {
+				log.Errorf("Failed to download video: %v", err)
+				return
+			}
+			exts, _ := mime.ExtensionsByType(video.GetMimetype())
+			path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
+			err = os.WriteFile(path, data, 0600)
+			if err != nil {
+				log.Errorf("Failed to save video: %v", err)
+				return
+			}
+			log.Infof("Saved video in message to %s", path)
 		}
 	case *events.Receipt:
 		if evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypeReadSelf {
