@@ -4,7 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-package mytest2
+package main
 
 import (
 	"context"
@@ -12,6 +12,8 @@ import (
 	"flag"
 	"fmt"
 	"mime"
+	"mytest2"
+	"mytest2/utils"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,7 +25,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/mattn/go-sqlite3"
-	amqp "github.com/rabbitmq/amqp091-go"
 	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow"
@@ -64,27 +65,6 @@ type ClientInstance struct {
 	HistorySyncID atomic.Int32
 }
 
-// 用于发送给 Spring Boot 的结构化事件
-type WaMessage struct {
-	UserID      string      `json:"userId"`      // 区分是哪个账号
-	MessageType string      `json:"messageType"` // Message, Presence, LoginQR
-	Message     interface{} `json:"message"`
-}
-
-// SessionManager 维护所有的 whatsmeow 客户端实例
-type SessionManager struct {
-	// clients: key 是用户的 JID (string)，value 是该用户的 whatsmeow.Client
-	clients map[string]*whatsmeow.Client
-
-	mu sync.RWMutex
-
-	// mqChannel: RabbitMQ 通道，用于发送事件给 Java 端
-	mqChannel *amqp.Channel
-
-	// 假设您使用一个固定的队列名称回传事件
-	eventQueueName string
-}
-
 type LoginRequest struct {
 	UserId     string `json:"userId" binding:"required"`
 	LoginPhone string `json:"loginPhone" binding:"required"`
@@ -100,41 +80,15 @@ type SubsObserversRequest struct {
 	ObserverIds []string `json:"observerIds" binding:"required"`
 }
 
-var globalManager *SessionManager
+var globalManager *mytest2.ClientManager
 
 // --- 主要逻辑函数 ---
 
 func main() {
 	mainLog := waLog.Stdout("Main", logLevel, true)
-	// 1. 初始化 RabbitMQ 和 SessionManager
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
-	if err != nil {
-		mainLog.Errorf("Failed to connect to RabbitMQ: %v", err)
-	}
-	defer conn.Close()
 
-	ch, err := conn.Channel()
-	if err != nil {
-		mainLog.Errorf("Failed to open RabbitMQ channel: %v", err)
-	}
-	defer ch.Close()
-
-	// 声明事件回传队列
-	queueName := "whatsapp_events_queue"
-	_, err = ch.QueueDeclare(queueName, true, false, false, false, nil)
-	if err != nil {
-		mainLog.Errorf("Failed to declare queue: %v", err)
-	}
-
-	globalManager = &SessionManager{
-		clients:        make(map[string]*whatsmeow.Client),
-		mqChannel:      ch,
-		eventQueueName: queueName,
-	}
-
-	//globalManager.pushEventToMQ(WSEvent{UserID: "userID",
-	//	EventType: "LoginQR",
-	//	Payload:   "Payload"})
+	mytest2.InitManager()
+	globalManager = mytest2.GetManager()
 
 	// 2. 启动 HTTP API Server
 	r := gin.Default()
@@ -179,8 +133,11 @@ func handleDisconnectRequest(ginCtx *gin.Context) {
 	fmt.Printf("Received disconnect request for userId: %s\n", disConnectRequest.UserId)
 	ginCtx.JSON(http.StatusOK, gin.H{"message": "Disconnect request receive"})
 	// 退出客户端
-	globalManager.clients[disConnectRequest.UserId].Disconnect()
-
+	client, getResult := globalManager.GetClient(disConnectRequest.UserId)
+	if !getResult {
+		log.Errorf("handleDisconnectRequest Could not get client: %s", disConnectRequest.UserId)
+	}
+	client.Disconnect()
 }
 
 func handleSubscribeObserversRequest(ginCtx *gin.Context) {
@@ -197,7 +154,10 @@ func handleSubscribeObserversRequest(ginCtx *gin.Context) {
 	fmt.Printf("Received subscribe observers request for userId: %s\n", userId)
 	ginCtx.JSON(http.StatusOK, gin.H{"message": "Subscribe observers request receive"})
 
-	client := globalManager.clients[userId]
+	client, getResult := globalManager.GetClient(subsObserversRequest.UserId)
+	if !getResult {
+		log.Errorf("handleSubscribeObserversRequest Could not get client: %s", subsObserversRequest.UserId)
+	}
 	ctx := context.Background()
 
 	observerIds := subsObserversRequest.ObserverIds
@@ -216,16 +176,11 @@ func handleSubscribeObserversRequest(ginCtx *gin.Context) {
 					message = fmt.Sprintf("%s: on whatsapp: %t, JID: %s", item.Query, item.IsIn, item.JID)
 				}
 				log.Infof(message)
-				globalManager.pushEventToMQ(WaMessage{
-					UserID:      userId,
-					MessageType: "check-user",
-					Message:     message,
-				})
 			}
 		}
 
 		// 订阅 observer 消息
-		jid, ok := ParseJID(GetJidString(observerId))
+		jid, ok := utils.ParseJID(utils.GetJidString(observerId))
 		if !ok {
 			return
 		}
@@ -253,38 +208,8 @@ func handleSubscribeObserversRequest(ginCtx *gin.Context) {
 		}
 
 		log.Infof(message)
-		globalManager.pushEventToMQ(WaMessage{
-			UserID:      userId,
-			MessageType: "set-avatar",
-			Message:     message,
-		})
 	}
 
-}
-
-// pushEventToMQ 将结构化事件推送到 RabbitMQ 队列
-func (sm *SessionManager) pushEventToMQ(waMessage WaMessage) {
-	body, err := json.Marshal(waMessage)
-	if err != nil {
-		log.Errorf("Failed to marshal waMessage for user %s: %v", waMessage.UserID, err)
-		return
-	}
-
-	// 使用 PublishWithContext 确保在连接断开时能够快速退出
-	err = sm.mqChannel.PublishWithContext(context.Background(),
-		"",                // exchange
-		sm.eventQueueName, // routing key (queue name)
-		false,             // mandatory
-		false,             // immediate
-		amqp.Publishing{
-			ContentType:  "application/json",
-			Body:         body,
-			DeliveryMode: amqp.Persistent, // 持久化消息
-		})
-
-	if err != nil {
-		log.Errorf("Failed to publish waMessage to MQ for user %s: %v", waMessage.UserID, err)
-	}
 }
 
 func startClient(request LoginRequest) {
@@ -438,8 +363,9 @@ func startAllClients() {
 
 // runClientInstance 初始化并运行单个 whatsmeow 客户端实例
 func runClientInstance(ctx context.Context, config ClientConfig) error {
-	log := waLog.Stdout(config.UserId, logLevel, true)
-	dbLog := waLog.Stdout(config.UserId+"-DB", logLevel, true)
+	userId := config.UserId
+	log := waLog.Stdout(userId, logLevel, true)
+	dbLog := waLog.Stdout(userId+"-DB", logLevel, true)
 
 	// 1. 初始化数据库存储
 	storeContainer, err := sqlstore.New(ctx, *dbDialect, config.DBAddress, dbLog)
@@ -455,7 +381,10 @@ func runClientInstance(ctx context.Context, config ClientConfig) error {
 	}
 
 	// 3. 创建客户端实例
-	cli := whatsmeow.NewClient(device, waLog.Stdout(config.UserId+"-Client", logLevel, true))
+	cli := whatsmeow.NewClient(device, waLog.Stdout(userId+"-Client", logLevel, true))
+	// 将其加入全局管理
+	globalManager.RegisterClient(userId, cli)
+
 	instance := &ClientInstance{
 		Config: config,
 		Client: cli,
@@ -478,11 +407,6 @@ func runClientInstance(ctx context.Context, config ClientConfig) error {
 	if err != nil {
 		panic(err)
 	}
-	globalManager.pushEventToMQ(WaMessage{
-		UserID:      config.UserId,
-		MessageType: "link-code",
-		Message:     linkingCode,
-	})
 	fmt.Println("Linking code:", linkingCode)
 
 	// 6. 阻塞，等待连接结束或上下文取消
@@ -495,7 +419,7 @@ func runClientInstance(ctx context.Context, config ClientConfig) error {
 	// whatsmeow.Client.Disconnect() 是非阻塞的，它会触发 StreamReplaced 事件
 	// 在你的原始 handler 中，StreamReplaced 会导致 os.Exit(0)，这在多客户端中是不对的
 	// 我们修改 handler 来适应多客户端环境
-	log.Infof("Client [%s] attempting to disconnect...", config.UserId)
+	log.Infof("Client [%s] attempting to disconnect...", userId)
 	cli.Disconnect()
 
 	// 确保客户端有时间断开连接，或者等待 StreamReplaced 事件被处理
@@ -510,7 +434,6 @@ func handleEvent(inst *ClientInstance, rawEvt interface{}) {
 	ctx := context.Background() // 使用新的上下文进行事件内的操作
 	log := inst.Log
 	cli := inst.Client
-	config := inst.Config
 
 	// --- 原始 handler 逻辑被复制并修改以使用 inst.Client 和 inst.Log ---
 	switch evt := rawEvt.(type) {
@@ -532,11 +455,6 @@ func handleEvent(inst *ClientInstance, rawEvt interface{}) {
 			log.Warnf("Failed to send available presence: %v", err)
 		} else {
 			log.Infof("Marked self as available")
-			globalManager.pushEventToMQ(WaMessage{
-				UserID:      config.UserId,
-				MessageType: "login-success",
-				Message:     "",
-			})
 		}
 	case *events.StreamReplaced:
 		// 在多客户端环境中，StreamReplaced 仅代表此客户端的连接被替换/关闭
@@ -598,11 +516,6 @@ func handleEvent(inst *ClientInstance, rawEvt interface{}) {
 			message = fmt.Sprintf("online: %s", result)
 		}
 		log.Infof(message)
-		globalManager.pushEventToMQ(WaMessage{
-			UserID:      config.UserId,
-			MessageType: "online-state",
-			Message:     message,
-		})
 	case *events.HistorySync:
 		id := inst.HistorySyncID.Add(1)
 		fileName := fmt.Sprintf("%s-history-%d-%d.json", inst.Config.UserId, startupTime, id)

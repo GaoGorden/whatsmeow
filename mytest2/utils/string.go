@@ -1,10 +1,13 @@
-package mytest2
+package utils
 
 import (
 	"strings"
 
 	"go.mau.fi/whatsmeow/types"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
+
+var log waLog.Logger
 
 const JID_SUFFIX = "@s.whatsapp.net"
 

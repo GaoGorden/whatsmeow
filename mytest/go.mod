@@ -1,4 +1,4 @@
-module go.mau.fi/whatsmeow/mytest
+module mytest
 
 go 1.24.0
 

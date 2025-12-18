@@ -5,7 +5,6 @@ go 1.24.0
 require (
 	github.com/gin-gonic/gin v1.11.0
 	github.com/mattn/go-sqlite3 v1.14.32
-	github.com/rabbitmq/amqp091-go v1.10.0
 	go.mau.fi/whatsmeow v0.0.0-20251014132254-6048f61ae25b
 	google.golang.org/protobuf v1.36.10
 )

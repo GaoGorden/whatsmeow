@@ -1092,6 +1092,57 @@ func handler(rawEvt interface{}) {
 
 		log.Infof("Received message %s from %s (%s): %+v", evt.Info.ID, evt.Info.SourceString(), strings.Join(metaParts, ", "), evt.Message)
 
+		extendMsg := evt.Message.GetExtendedTextMessage()
+		if extendMsg != nil {
+			contextInfo := extendMsg.GetContextInfo()
+			stanzaID := contextInfo.GetStanzaID()
+			fmt.Printf("存在 extendMsg，stanzaID: %s\n", stanzaID)
+
+			// 存在 view once 引用消息。
+			if contextInfo != nil {
+				fmt.Printf("存在 view once 引用消息，stanzaID: %s\n", stanzaID)
+				quotedMsg := contextInfo.GetQuotedMessage()
+				if quotedMsg != nil {
+
+					// 下载 view once 图片
+					img := quotedMsg.GetImageMessage()
+					if img != nil && img.GetViewOnce() {
+						data, err := cli.Download(ctx, img)
+						if err != nil {
+							log.Errorf("Failed to download view once image: %v", err)
+							return
+						}
+						exts, _ := mime.ExtensionsByType(img.GetMimetype())
+						path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
+						err = os.WriteFile(path, data, 0600)
+						if err != nil {
+							log.Errorf("Failed to save view once image: %v", err)
+							return
+						}
+						log.Infof("Saved view once image in message to %s", path)
+					}
+
+					// 下载 view once 视频
+					video := quotedMsg.GetVideoMessage()
+					if video != nil && video.GetViewOnce() {
+						data, err := cli.Download(ctx, video)
+						if err != nil {
+							log.Errorf("Failed to download view once video: %v", err)
+							return
+						}
+						exts, _ := mime.ExtensionsByType(video.GetMimetype())
+						path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
+						err = os.WriteFile(path, data, 0600)
+						if err != nil {
+							log.Errorf("Failed to save view once video: %v", err)
+							return
+						}
+						log.Infof("Saved view once video in message to %s", path)
+					}
+				}
+			}
+		}
+
 		if evt.Message.GetPollUpdateMessage() != nil {
 			decrypted, err := cli.DecryptPollVote(ctx, evt)
 			if err != nil {
@@ -1144,6 +1195,8 @@ func handler(rawEvt interface{}) {
 			}
 			log.Infof("Saved video in message to %s", path)
 		}
+	case *events.UndecryptableMessage:
+		log.Infof("Received undecryptableMessage %s from %s (%s): %+v", evt.Info.ID, evt.Info.SourceString())
 	case *events.Receipt:
 		if evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypeReadSelf {
 			log.Infof("%v was read by %s at %s", evt.MessageIDs, evt.SourceString(), evt.Timestamp)
