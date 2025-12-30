@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/mattn/go-sqlite3 v1.14.32
+	github.com/mdp/qrterminal/v3 v3.2.1
 	go.mau.fi/whatsmeow v0.0.0-20251014132254-6048f61ae25b
 	google.golang.org/protobuf v1.36.10
 )
@@ -25,7 +26,9 @@ require (
 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/term v0.37.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
+	rsc.io/qr v0.2.0 // indirect
 )
 
 replace go.mau.fi/whatsmeow => ../

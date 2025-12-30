@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"mime"
 	"mytest2"
+	"mytest2/bean"
 	"mytest2/utils"
 	"net/http"
 	"os"
@@ -71,7 +72,7 @@ type LoginRequest struct {
 	VerifyCode string `json:"verifyCode" binding:"required"`
 }
 
-type DisconnectRequest struct {
+type UserIdRequest struct {
 	UserId string `json:"userId" binding:"required"`
 }
 
@@ -80,23 +81,45 @@ type SubsObserversRequest struct {
 	ObserverIds []string `json:"observerIds" binding:"required"`
 }
 
+var mainLog = waLog.Stdout("Main", logLevel, true)
+
+var waClientInfo bean.WaClientInfo
+
 var globalManager *mytest2.ClientManager
 
 // --- 主要逻辑函数 ---
 
 func main() {
-	mainLog := waLog.Stdout("Main", logLevel, true)
+	// 1. 读取配置文件
+	dir, err := os.Getwd()
+	mainLog.Infof("Current dir: %s", dir)
+	content, err := os.ReadFile("WaClientInfo.json")
+	if err != nil {
+		mainLog.Errorf("Error reading WaClientInfo.json: %v\n", err)
+		return
+	}
+	err = json.Unmarshal(content, &waClientInfo)
+	if err != nil {
+		mainLog.Errorf("Error unmarshalling WaClientInfo.json: %v\n", err)
+		return
+	}
+	mainLog.Infof("WaClientInfo.json load success, user's file root path: %s.", waClientInfo.UserFile)
 
+	// 2. 初始化 ClientManager
 	mytest2.InitManager()
 	globalManager = mytest2.GetManager()
+	mainLog.Infof("ClientManager init success.")
 
-	// 2. 启动 HTTP API Server
+	// 3. 启动 HTTP API Server
 	r := gin.Default()
 	r.POST("/login", handleLoginRequest)                           // 接收登录请求
+	r.POST("/reLoginUsers", handleReLoginUsersRequest)             // 接收重新登录请求
+	r.POST("/reconnect", handleReconnectRequest)                   // 接收重连请求
 	r.POST("/disconnect", handleDisconnectRequest)                 // 接收退出请求
-	r.POST("/subscribeObservers", handleSubscribeObserversRequest) // 接收退出请求
+	r.POST("/subscribeObservers", handleSubscribeObserversRequest) // 接收订阅lastseen请求
 
 	mainLog.Infof("Starting HTTP server on :9090")
+	mainLog.Infof("WaClient is ready")
 	if err := r.Run(":9090"); err != nil {
 		mainLog.Errorf("Failed to run server: %v", err)
 	}
@@ -113,31 +136,91 @@ func handleLoginRequest(ginCtx *gin.Context) {
 	}
 
 	// 绑定成功，现在可以使用 loginRequest.Username 和 loginRequest.Password
-	fmt.Printf("Received login request for userId: %s\n", loginRequest.UserId)
-	ginCtx.JSON(http.StatusOK, gin.H{"message": "Login request receive"})
-	// ... 执行登录逻辑 ...
-	startClient(loginRequest)
+	mainLog.Infof("cli-[%s] Received login request", loginRequest.UserId)
 
+	// ... 异步执行登录逻辑 ...
+	//startClient(loginRequest)
+	go func(req LoginRequest) {
+		// 在后台执行，即使 handleLoginRequest 结束了，这里也会继续运行
+		startClient(req)
+	}(loginRequest)
+
+	ginCtx.JSON(http.StatusOK, gin.H{"message": "Login request receive"})
 }
 
-func handleDisconnectRequest(ginCtx *gin.Context) {
-	var disConnectRequest DisconnectRequest
+func handleReLoginUsersRequest(ginCtx *gin.Context) {
+	var loginRequests []LoginRequest
 
 	// 尝试将请求体（通常是 JSON）绑定到结构体
-	if err := ginCtx.ShouldBindJSON(&disConnectRequest); err != nil {
+	if err := ginCtx.ShouldBindJSON(&loginRequests); err != nil {
 		// 如果绑定失败（例如 JSON 格式错误或缺少 required 字段）
 		ginCtx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	fmt.Printf("Received disconnect request for userId: %s\n", disConnectRequest.UserId)
-	ginCtx.JSON(http.StatusOK, gin.H{"message": "Disconnect request receive"})
-	// 退出客户端
-	client, getResult := globalManager.GetClient(disConnectRequest.UserId)
-	if !getResult {
-		log.Errorf("handleDisconnectRequest Could not get client: %s", disConnectRequest.UserId)
+	// 绑定成功，现在可以使用 loginRequest.Username 和 loginRequest.Password
+	mainLog.Infof("Received reLoginUsers request for users: %s\n", len(loginRequests))
+
+	// ... 异步执行登录逻辑 ...
+	for _, req := range loginRequests {
+		// 重要：将当前的 req 显式传给匿名函数
+		go func(r LoginRequest) {
+			startClient(r)
+		}(req)
 	}
+
+	ginCtx.JSON(http.StatusOK, gin.H{
+		"message": "Processing login requests",
+		"count":   len(loginRequests),
+	})
+}
+
+func handleReconnectRequest(ginCtx *gin.Context) {
+	var userIdRequest UserIdRequest
+
+	// 尝试将请求体（通常是 JSON）绑定到结构体
+	if err := ginCtx.ShouldBindJSON(&userIdRequest); err != nil {
+		// 如果绑定失败（例如 JSON 格式错误或缺少 required 字段）
+		ginCtx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	mainLog.Infof("cli-[%s] Received reconnect request", userIdRequest.UserId)
+
+	// 重启客户端
+	clientEntry, getResult := globalManager.GetClient(userIdRequest.UserId)
+	client := clientEntry.Client
+	clientLog := client.Log
+
+	if !getResult {
+		mainLog.Errorf("cli-[%s] handleReconnectRequest Could not get client", userIdRequest.UserId)
+	}
+
 	client.Disconnect()
+	err := client.Connect()
+	if err != nil {
+		clientLog.Errorf("failed to connect: %v", err)
+	}
+
+	ginCtx.JSON(http.StatusOK, gin.H{"message": "reconnect request receive"})
+}
+
+func handleDisconnectRequest(ginCtx *gin.Context) {
+	var userIdRequest UserIdRequest
+
+	// 尝试将请求体（通常是 JSON）绑定到结构体
+	if err := ginCtx.ShouldBindJSON(&userIdRequest); err != nil {
+		// 如果绑定失败（例如 JSON 格式错误或缺少 required 字段）
+		ginCtx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	mainLog.Infof("cli-[%s] Received disconnect request", userIdRequest.UserId)
+
+	// 退出客户端
+	globalManager.UnregisterAndStop(userIdRequest.UserId)
+
+	ginCtx.JSON(http.StatusOK, gin.H{"message": "Disconnect request receive"})
 }
 
 func handleSubscribeObserversRequest(ginCtx *gin.Context) {
@@ -151,12 +234,13 @@ func handleSubscribeObserversRequest(ginCtx *gin.Context) {
 	}
 
 	userId := subsObserversRequest.UserId
-	fmt.Printf("Received subscribe observers request for userId: %s\n", userId)
-	ginCtx.JSON(http.StatusOK, gin.H{"message": "Subscribe observers request receive"})
+	mainLog.Infof("Received subscribe observers request for userId: %s\n", userId)
 
-	client, getResult := globalManager.GetClient(subsObserversRequest.UserId)
+	clientEntry, getResult := globalManager.GetClient(subsObserversRequest.UserId)
+	client := clientEntry.Client
+	clientLog := client.Log
 	if !getResult {
-		log.Errorf("handleSubscribeObserversRequest Could not get client: %s", subsObserversRequest.UserId)
+		mainLog.Errorf("cli-[%s] handleSubscribeObserversRequest Could not get client", subsObserversRequest.UserId)
 	}
 	ctx := context.Background()
 
@@ -166,7 +250,7 @@ func handleSubscribeObserversRequest(ginCtx *gin.Context) {
 		// 查看 observer 是否存在
 		resp, checkErr := client.IsOnWhatsApp(ctx, []string{"+" + observerId})
 		if checkErr != nil {
-			log.Errorf("Failed to check if users are on WhatsApp:", checkErr)
+			clientLog.Infof("Failed to check if users are on WhatsApp: %v", checkErr)
 		} else {
 			for _, item := range resp {
 				var message = ""
@@ -175,7 +259,7 @@ func handleSubscribeObserversRequest(ginCtx *gin.Context) {
 				} else {
 					message = fmt.Sprintf("%s: on whatsapp: %t, JID: %s", item.Query, item.IsIn, item.JID)
 				}
-				log.Infof(message)
+				clientLog.Infof(message)
 			}
 		}
 
@@ -186,7 +270,7 @@ func handleSubscribeObserversRequest(ginCtx *gin.Context) {
 		}
 		subsErr := client.SubscribePresence(ctx, jid)
 		if subsErr != nil {
-			fmt.Println(subsErr)
+			clientLog.Infof("Failed to SubscribePresence: %v", subsErr)
 		}
 
 		// 获取 observer 头像
@@ -207,9 +291,10 @@ func handleSubscribeObserversRequest(ginCtx *gin.Context) {
 			message = fmt.Sprintf("Failed to get avatar: %s", jid)
 		}
 
-		log.Infof(message)
+		clientLog.Infof(message)
 	}
 
+	ginCtx.JSON(http.StatusOK, gin.H{"message": "Subscribe observers request receive", "count": len(observerIds)})
 }
 
 func startClient(request LoginRequest) {
@@ -229,12 +314,8 @@ func startClient(request LoginRequest) {
 		}
 	}
 
-	mainLog := waLog.Stdout("Main", logLevel, true)
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-
-	var dbPath = "D:\\desktop\\ggdo\\test_workplace\\userFile\\" + request.VerifyCode + ".db"
-	mainLog.Infof("[%s] dbPath: %s", request.UserId, dbPath)
+	var dbPath = waClientInfo.UserFile + "/" + request.VerifyCode + ".db"
+	mainLog.Infof("cli-[%s] dbPath: %s", request.UserId, dbPath)
 
 	// 定义所有客户端的配置
 	// **重要：每个客户端必须有唯一的 DBAddress，以隔离会话数据**
@@ -244,17 +325,25 @@ func startClient(request LoginRequest) {
 		DBAddress:  "file:" + dbPath + "?_foreign_keys=on", // 独立的数据库文件
 	}
 
-	wg.Add(1)
+	parentCtx, globalCancel := context.WithCancel(context.Background())
+	var waitGroup sync.WaitGroup
+
+	// 为这个特定的客户端创建一个子 Context
+	// 当 parentCtx 取消，或者调用这个 subCancel 时，协程都会停止
+	subCtx, subCancel := context.WithCancel(parentCtx)
+
+	waitGroup.Add(1)
 	// 为每个客户端启动一个独立的 Go routine
-	go func(cfg ClientConfig) {
-		defer wg.Done()
-		err := runClientInstance(ctx, cfg)
+	// cfg, ctx 传参：ctx传参为了注明声明周期
+	go func(cfg ClientConfig, ctx context.Context) {
+		defer waitGroup.Done()
+		err := runClientInstance(ctx, cfg, subCancel)
 		if err != nil {
-			mainLog.Errorf("[%s] Client terminated with error: %v", cfg.UserId, err)
+			mainLog.Errorf("cli-[%s] terminated with error: %v", cfg.UserId, err)
 		} else {
-			mainLog.Infof("[%s] Client disconnected gracefully.", cfg.UserId)
+			mainLog.Infof("cli-[%s] disconnected gracefully.", cfg.UserId)
 		}
-	}(clientConfig)
+	}(clientConfig, subCtx)
 
 	// 监听系统中断信号
 	c := make(chan os.Signal, 1)
@@ -265,10 +354,10 @@ func startClient(request LoginRequest) {
 	mainLog.Infof("Interrupt received, starting graceful shutdown...")
 
 	// 通知所有客户端断开连接
-	cancel()
+	globalCancel()
 
 	// 等待所有客户端 goroutine 退出
-	wg.Wait()
+	waitGroup.Wait()
 	mainLog.Infof("All clients shut down. Exiting.")
 }
 
@@ -290,8 +379,12 @@ func startAllClients() {
 	}
 
 	mainLog := waLog.Stdout("Main", logLevel, true)
-	ctx, cancel := context.WithCancel(context.Background())
+	parentCtx, globalCancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
+
+	// 为这个特定的客户端创建一个子 Context
+	// 当 parentCtx 取消，或者调用这个 subCancel 时，协程都会停止
+	subCtx, subCancel := context.WithCancel(parentCtx)
 
 	// 定义所有客户端的配置
 	// **重要：每个客户端必须有唯一的 DBAddress，以隔离会话数据**
@@ -334,15 +427,15 @@ func startAllClients() {
 	for _, config := range clientConfigs {
 		wg.Add(1)
 		// 为每个客户端启动一个独立的 Go routine
-		go func(cfg ClientConfig) {
+		go func(cfg ClientConfig, ctx context.Context) {
 			defer wg.Done()
-			err := runClientInstance(ctx, cfg)
+			err := runClientInstance(ctx, cfg, subCancel)
 			if err != nil {
 				mainLog.Errorf("[%s] Client terminated with error: %v", cfg.UserId, err)
 			} else {
 				mainLog.Infof("[%s] Client disconnected gracefully.", cfg.UserId)
 			}
-		}(config)
+		}(config, subCtx)
 	}
 
 	// 监听系统中断信号
@@ -354,7 +447,7 @@ func startAllClients() {
 	mainLog.Infof("Interrupt received, starting graceful shutdown...")
 
 	// 通知所有客户端断开连接
-	cancel()
+	globalCancel()
 
 	// 等待所有客户端 goroutine 退出
 	wg.Wait()
@@ -362,10 +455,10 @@ func startAllClients() {
 }
 
 // runClientInstance 初始化并运行单个 whatsmeow 客户端实例
-func runClientInstance(ctx context.Context, config ClientConfig) error {
+func runClientInstance(ctx context.Context, config ClientConfig, cancel context.CancelFunc) error {
 	userId := config.UserId
-	log := waLog.Stdout(userId, logLevel, true)
-	dbLog := waLog.Stdout(userId+"-DB", logLevel, true)
+	clientLog := waLog.Stdout("Client-"+userId, logLevel, true)
+	dbLog := waLog.Stdout("DB-"+userId, logLevel, true)
 
 	// 1. 初始化数据库存储
 	storeContainer, err := sqlstore.New(ctx, *dbDialect, config.DBAddress, dbLog)
@@ -381,14 +474,14 @@ func runClientInstance(ctx context.Context, config ClientConfig) error {
 	}
 
 	// 3. 创建客户端实例
-	cli := whatsmeow.NewClient(device, waLog.Stdout(userId+"-Client", logLevel, true))
+	cli := whatsmeow.NewClient(device, clientLog)
 	// 将其加入全局管理
-	globalManager.RegisterClient(userId, cli)
+	globalManager.RegisterClient(userId, cli, cancel)
 
 	instance := &ClientInstance{
 		Config: config,
 		Client: cli,
-		Log:    log,
+		Log:    clientLog,
 	}
 
 	// 4. 注册事件处理器
@@ -407,7 +500,7 @@ func runClientInstance(ctx context.Context, config ClientConfig) error {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("Linking code:", linkingCode)
+	clientLog.Infof("Linking code: %s", linkingCode)
 
 	// 6. 阻塞，等待连接结束或上下文取消
 	<-ctx.Done()
@@ -419,7 +512,7 @@ func runClientInstance(ctx context.Context, config ClientConfig) error {
 	// whatsmeow.Client.Disconnect() 是非阻塞的，它会触发 StreamReplaced 事件
 	// 在你的原始 handler 中，StreamReplaced 会导致 os.Exit(0)，这在多客户端中是不对的
 	// 我们修改 handler 来适应多客户端环境
-	log.Infof("Client [%s] attempting to disconnect...", userId)
+	clientLog.Infof("Client [%s] attempting to disconnect...", userId)
 	cli.Disconnect()
 
 	// 确保客户端有时间断开连接，或者等待 StreamReplaced 事件被处理

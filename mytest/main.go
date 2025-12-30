@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"mime"
@@ -34,6 +35,8 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+
+	"github.com/mdp/qrterminal/v3"
 
 	"C"
 )
@@ -96,24 +99,24 @@ func main() {
 		return true
 	}
 
-	//ch, err := cli.GetQRChannel(context.Background())
-	//if err != nil {
-	//	// This error means that we're already logged in, so ignore it.
-	//	if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
-	//		log.Errorf("Failed to get QR channel: %v", err)
-	//	}
-	//} else {
-	//	go func() {
-	//		for evt := range ch {
-	//			if evt.Event == "code" {
-	//				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-	//				log.Infof("qrcode: $%s$", evt.Code)
-	//			} else {
-	//				log.Infof("QR channel result: %s", evt.Event)
-	//			}
-	//		}
-	//	}()
-	//}
+	ch, err := cli.GetQRChannel(context.Background())
+	if err != nil {
+		// This error means that we're already logged in, so ignore it.
+		if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
+			log.Errorf("Failed to get QR channel: %v", err)
+		}
+	} else {
+		go func() {
+			for evt := range ch {
+				if evt.Event == "code" {
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					log.Infof("qrcode: $%s$", evt.Code)
+				} else {
+					log.Infof("QR channel result: %s", evt.Event)
+				}
+			}
+		}()
+	}
 
 	cli.AddEventHandler(handler)
 	err = cli.Connect()
@@ -1092,57 +1095,6 @@ func handler(rawEvt interface{}) {
 
 		log.Infof("Received message %s from %s (%s): %+v", evt.Info.ID, evt.Info.SourceString(), strings.Join(metaParts, ", "), evt.Message)
 
-		extendMsg := evt.Message.GetExtendedTextMessage()
-		if extendMsg != nil {
-			contextInfo := extendMsg.GetContextInfo()
-			stanzaID := contextInfo.GetStanzaID()
-			fmt.Printf("存在 extendMsg，stanzaID: %s\n", stanzaID)
-
-			// 存在 view once 引用消息。
-			if contextInfo != nil {
-				fmt.Printf("存在 view once 引用消息，stanzaID: %s\n", stanzaID)
-				quotedMsg := contextInfo.GetQuotedMessage()
-				if quotedMsg != nil {
-
-					// 下载 view once 图片
-					img := quotedMsg.GetImageMessage()
-					if img != nil && img.GetViewOnce() {
-						data, err := cli.Download(ctx, img)
-						if err != nil {
-							log.Errorf("Failed to download view once image: %v", err)
-							return
-						}
-						exts, _ := mime.ExtensionsByType(img.GetMimetype())
-						path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-						err = os.WriteFile(path, data, 0600)
-						if err != nil {
-							log.Errorf("Failed to save view once image: %v", err)
-							return
-						}
-						log.Infof("Saved view once image in message to %s", path)
-					}
-
-					// 下载 view once 视频
-					video := quotedMsg.GetVideoMessage()
-					if video != nil && video.GetViewOnce() {
-						data, err := cli.Download(ctx, video)
-						if err != nil {
-							log.Errorf("Failed to download view once video: %v", err)
-							return
-						}
-						exts, _ := mime.ExtensionsByType(video.GetMimetype())
-						path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-						err = os.WriteFile(path, data, 0600)
-						if err != nil {
-							log.Errorf("Failed to save view once video: %v", err)
-							return
-						}
-						log.Infof("Saved view once video in message to %s", path)
-					}
-				}
-			}
-		}
-
 		if evt.Message.GetPollUpdateMessage() != nil {
 			decrypted, err := cli.DecryptPollVote(ctx, evt)
 			if err != nil {
@@ -1163,37 +1115,54 @@ func handler(rawEvt interface{}) {
 		}
 
 		img := evt.Message.GetImageMessage()
-		if img != nil {
+		if img != nil && img.GetViewOnce() {
 			data, err := cli.Download(ctx, img)
 			if err != nil {
-				log.Errorf("Failed to download image: %v", err)
+				log.Errorf("Failed to download view once image: %v", err)
 				return
 			}
 			exts, _ := mime.ExtensionsByType(img.GetMimetype())
 			path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
 			err = os.WriteFile(path, data, 0600)
 			if err != nil {
-				log.Errorf("Failed to save image: %v", err)
+				log.Errorf("Failed to save view once image: %v", err)
 				return
 			}
-			log.Infof("Saved image in message to %s", path)
+			log.Infof("Saved view once image in message to %s", path)
 		}
 
 		video := evt.Message.GetVideoMessage()
-		if video != nil {
+		if video != nil && video.GetViewOnce() {
 			data, err := cli.Download(ctx, video)
 			if err != nil {
-				log.Errorf("Failed to download video: %v", err)
+				log.Errorf("Failed to download view once video: %v", err)
 				return
 			}
 			exts, _ := mime.ExtensionsByType(video.GetMimetype())
 			path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
 			err = os.WriteFile(path, data, 0600)
 			if err != nil {
-				log.Errorf("Failed to save video: %v", err)
+				log.Errorf("Failed to save view once video: %v", err)
 				return
 			}
-			log.Infof("Saved video in message to %s", path)
+			log.Infof("Saved view once video in message to %s", path)
+		}
+
+		audio := evt.Message.GetAudioMessage()
+		if audio != nil && audio.GetViewOnce() {
+			data, err := cli.Download(ctx, audio)
+			if err != nil {
+				log.Errorf("Failed to download view once audio: %v", err)
+				return
+			}
+			exts, _ := mime.ExtensionsByType(audio.GetMimetype())
+			path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
+			err = os.WriteFile(path, data, 0600)
+			if err != nil {
+				log.Errorf("Failed to save view once audio: %v", err)
+				return
+			}
+			log.Infof("Saved view once audio in message to %s", path)
 		}
 	case *events.UndecryptableMessage:
 		log.Infof("Received undecryptableMessage %s from %s (%s): %+v", evt.Info.ID, evt.Info.SourceString())
