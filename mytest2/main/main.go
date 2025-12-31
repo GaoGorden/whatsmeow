@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"mime"
@@ -81,11 +82,18 @@ type SubsObserversRequest struct {
 	ObserverIds []string `json:"observerIds" binding:"required"`
 }
 
+var isClientReady = false
 var mainLog = waLog.Stdout("Main", logLevel, true)
 
 var waClientInfo bean.WaClientInfo
 
 var globalManager *mytest2.ClientManager
+
+var srv *http.Server
+
+var parentCtx context.Context
+var globalCancel context.CancelFunc
+var waitGroup sync.WaitGroup
 
 // --- 主要逻辑函数 ---
 
@@ -105,24 +113,69 @@ func main() {
 	}
 	mainLog.Infof("WaClientInfo.json load success, user's file root path: %s.", waClientInfo.UserFile)
 
-	// 2. 初始化 ClientManager
+	// 2. 初始化 ClientManager 等全局变量
 	mytest2.InitManager()
 	globalManager = mytest2.GetManager()
-	mainLog.Infof("ClientManager init success.")
+	parentCtx, globalCancel = context.WithCancel(context.Background())
+	mainLog.Infof("Global Variable init success.")
 
 	// 3. 启动 HTTP API Server
 	r := gin.Default()
+	r.GET("/checkState", func(c *gin.Context) {
+		var clientState string
+		if isClientReady {
+			clientState = "isReady"
+		} else {
+			clientState = "notReady"
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status": clientState,
+		})
+	})
+
 	r.POST("/login", handleLoginRequest)                           // 接收登录请求
 	r.POST("/reLoginUsers", handleReLoginUsersRequest)             // 接收重新登录请求
 	r.POST("/reconnect", handleReconnectRequest)                   // 接收重连请求
 	r.POST("/disconnect", handleDisconnectRequest)                 // 接收退出请求
 	r.POST("/subscribeObservers", handleSubscribeObserversRequest) // 接收订阅lastseen请求
 
-	mainLog.Infof("Starting HTTP server on :9090")
-	mainLog.Infof("WaClient is ready")
-	if err := r.Run(":9090"); err != nil {
-		mainLog.Errorf("Failed to run server: %v", err)
+	// 4. 启动服务
+	// 将 Gin 放入 http.Server 中
+	srv = &http.Server{
+		Addr:    ":9090",
+		Handler: r,
 	}
+	go func() {
+		mainLog.Infof("Starting HTTP server on :9090")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			mainLog.Errorf("Failed to run server: %v", err)
+		}
+	}()
+	//if err := r.Run(":9090"); err != nil {
+	//	mainLog.Errorf("Failed to run server: %v", err)
+	//}
+
+	mainLog.Infof("WaClient is ready")
+	isClientReady = true
+
+	// 监听系统中断信号
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	// 阻塞直到接收到中断信号
+	<-c
+	mainLog.Infof("Interrupt received, starting graceful shutdown...")
+
+	if err := srv.Shutdown(context.Background()); err != nil {
+		mainLog.Errorf("Server Shutdown forced: %v", err)
+	}
+
+	// 通知所有客户端断开连接
+	globalCancel()
+
+	// 等待所有客户端 goroutine 退出
+	waitGroup.Wait()
+	mainLog.Infof("All clients shut down. Exiting.")
 }
 
 func handleLoginRequest(ginCtx *gin.Context) {
@@ -159,7 +212,7 @@ func handleReLoginUsersRequest(ginCtx *gin.Context) {
 	}
 
 	// 绑定成功，现在可以使用 loginRequest.Username 和 loginRequest.Password
-	mainLog.Infof("Received reLoginUsers request for users: %s\n", len(loginRequests))
+	mainLog.Infof("Received reLoginUsers request for user count: %d", len(loginRequests))
 
 	// ... 异步执行登录逻辑 ...
 	for _, req := range loginRequests {
@@ -170,7 +223,7 @@ func handleReLoginUsersRequest(ginCtx *gin.Context) {
 	}
 
 	ginCtx.JSON(http.StatusOK, gin.H{
-		"message": "Processing login requests",
+		"message": "Processing reLoginUsers request",
 		"count":   len(loginRequests),
 	})
 }
@@ -325,9 +378,6 @@ func startClient(request LoginRequest) {
 		DBAddress:  "file:" + dbPath + "?_foreign_keys=on", // 独立的数据库文件
 	}
 
-	parentCtx, globalCancel := context.WithCancel(context.Background())
-	var waitGroup sync.WaitGroup
-
 	// 为这个特定的客户端创建一个子 Context
 	// 当 parentCtx 取消，或者调用这个 subCancel 时，协程都会停止
 	subCtx, subCancel := context.WithCancel(parentCtx)
@@ -344,21 +394,6 @@ func startClient(request LoginRequest) {
 			mainLog.Infof("cli-[%s] disconnected gracefully.", cfg.UserId)
 		}
 	}(clientConfig, subCtx)
-
-	// 监听系统中断信号
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-	// 阻塞直到接收到中断信号
-	<-c
-	mainLog.Infof("Interrupt received, starting graceful shutdown...")
-
-	// 通知所有客户端断开连接
-	globalCancel()
-
-	// 等待所有客户端 goroutine 退出
-	waitGroup.Wait()
-	mainLog.Infof("All clients shut down. Exiting.")
 }
 
 func startAllClients() {

@@ -104,7 +104,7 @@ func SetWAVersion(version WAVersionContainer) {
 
 var BaseClientPayload = &waWa6.ClientPayload{
 	UserAgent: &waWa6.ClientPayload_UserAgent{
-		Platform:       waWa6.ClientPayload_UserAgent_WEB.Enum(),
+		Platform:       waWa6.ClientPayload_UserAgent_ANDROID.Enum(),
 		ReleaseChannel: waWa6.ClientPayload_UserAgent_RELEASE.Enum(),
 		AppVersion:     waVersion.ProtoAppVersion(),
 		Mcc:            proto.String("000"),
