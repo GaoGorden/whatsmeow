@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"mime"
@@ -23,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	_ "github.com/mattn/go-sqlite3"
 	"google.golang.org/protobuf/proto"
 
@@ -36,7 +36,11 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
-	"github.com/mdp/qrterminal/v3"
+	// amazon s3
+	"bytes"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"C"
 )
@@ -99,24 +103,24 @@ func main() {
 		return true
 	}
 
-	ch, err := cli.GetQRChannel(context.Background())
-	if err != nil {
-		// This error means that we're already logged in, so ignore it.
-		if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
-			log.Errorf("Failed to get QR channel: %v", err)
-		}
-	} else {
-		go func() {
-			for evt := range ch {
-				if evt.Event == "code" {
-					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-					log.Infof("qrcode: $%s$", evt.Code)
-				} else {
-					log.Infof("QR channel result: %s", evt.Event)
-				}
-			}
-		}()
-	}
+	//ch, err := cli.GetQRChannel(context.Background())
+	//if err != nil {
+	//	// This error means that we're already logged in, so ignore it.
+	//	if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
+	//		log.Errorf("Failed to get QR channel: %v", err)
+	//	}
+	//} else {
+	//	go func() {
+	//		for evt := range ch {
+	//			if evt.Event == "code" {
+	//				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+	//				log.Infof("qrcode: $%s$", evt.Code)
+	//			} else {
+	//				log.Infof("QR channel result: %s", evt.Event)
+	//			}
+	//		}
+	//	}()
+	//}
 
 	cli.AddEventHandler(handler)
 	err = cli.Connect()
@@ -1121,14 +1125,22 @@ func handler(rawEvt interface{}) {
 				log.Errorf("Failed to download view once image: %v", err)
 				return
 			}
-			exts, _ := mime.ExtensionsByType(img.GetMimetype())
-			path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-			err = os.WriteFile(path, data, 0600)
-			if err != nil {
-				log.Errorf("Failed to save view once image: %v", err)
+			//exts, _ := mime.ExtensionsByType(img.GetMimetype())
+			//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
+			//err = os.WriteFile(path, data, 0600)
+			//if err != nil {
+			//	log.Errorf("Failed to save view once image: %v", err)
+			//	return
+			//}
+			//log.Infof("Saved view once image in message to %s", path)
+
+			observerId := evt.Info.Sender.User
+			pushName := evt.Info.PushName
+			uploadErr := uploadAndNotify(observerId, pushName, img.GetMimetype(), evt.Info.ID, data)
+			if uploadErr != nil {
+				log.Errorf("Failed to upload view once image: %v", uploadErr)
 				return
 			}
-			log.Infof("Saved view once image in message to %s", path)
 		}
 
 		video := evt.Message.GetVideoMessage()
@@ -1138,14 +1150,22 @@ func handler(rawEvt interface{}) {
 				log.Errorf("Failed to download view once video: %v", err)
 				return
 			}
-			exts, _ := mime.ExtensionsByType(video.GetMimetype())
-			path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-			err = os.WriteFile(path, data, 0600)
-			if err != nil {
-				log.Errorf("Failed to save view once video: %v", err)
+			//exts, _ := mime.ExtensionsByType(video.GetMimetype())
+			//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
+			//err = os.WriteFile(path, data, 0600)
+			//if err != nil {
+			//	log.Errorf("Failed to save view once video: %v", err)
+			//	return
+			//}
+			//log.Infof("Saved view once video in message to %s", path)
+
+			observerId := evt.Info.Sender.User
+			pushName := evt.Info.PushName
+			uploadErr := uploadAndNotify(observerId, pushName, video.GetMimetype(), evt.Info.ID, data)
+			if uploadErr != nil {
+				log.Errorf("Failed to upload view once video: %v", uploadErr)
 				return
 			}
-			log.Infof("Saved view once video in message to %s", path)
 		}
 
 		audio := evt.Message.GetAudioMessage()
@@ -1155,14 +1175,21 @@ func handler(rawEvt interface{}) {
 				log.Errorf("Failed to download view once audio: %v", err)
 				return
 			}
-			exts, _ := mime.ExtensionsByType(audio.GetMimetype())
-			path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-			err = os.WriteFile(path, data, 0600)
-			if err != nil {
-				log.Errorf("Failed to save view once audio: %v", err)
+			//exts, _ := mime.ExtensionsByType(audio.GetMimetype())
+			//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
+			//err = os.WriteFile(path, data, 0600)
+			//if err != nil {
+			//	log.Errorf("Failed to save view once audio: %v", err)
+			//	return
+			//}
+			//log.Infof("Saved view once audio in message to %s", path)
+			observerId := evt.Info.Sender.User
+			pushName := evt.Info.PushName
+			uploadErr := uploadAndNotify(observerId, pushName, audio.GetMimetype(), evt.Info.ID, data)
+			if uploadErr != nil {
+				log.Errorf("Failed to upload view once audio: %v", uploadErr)
 				return
 			}
-			log.Infof("Saved view once audio in message to %s", path)
 		}
 	case *events.UndecryptableMessage:
 		log.Infof("Received undecryptableMessage %s from %s (%s): %+v", evt.Info.ID, evt.Info.SourceString())
@@ -1222,4 +1249,48 @@ func handler(rawEvt interface{}) {
 	case *events.Blocklist:
 		log.Infof("Blocklist event: %+v", evt)
 	}
+}
+
+func uploadAndNotify(observerId string, pushName string, miniType string, fileName string, fileData []byte) error {
+
+	staticProvider := credentials.NewStaticCredentialsProvider(
+		"AKIARUEBY6SBGOZK6U5U",
+		"83mAuFMthTRG8vonguHutuZL4EdnfWmYom14+9mb",
+		"", // SessionToken，通常留空
+	)
+
+	ctx := context.Background()
+	cfg, _ := config.LoadDefaultConfig(ctx,
+		config.WithRegion("us-east-2"),
+		config.WithCredentialsProvider(staticProvider),
+	)
+	s3Client := s3.NewFromConfig(cfg)
+
+	// 1. 定义 Object Key (建议包含用户ID和时间戳防止覆盖)
+	exts, _ := mime.ExtensionsByType(miniType)
+	objectKey := "whatsapp/view-once/" + fileName + exts[0]
+	bucket := "view-once"
+
+	// 2. 上传至 S3
+	_, err := s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: &bucket,
+		Key:    &objectKey,
+		Body:   bytes.NewReader(fileData),
+	})
+	if err != nil {
+		return err
+	}
+
+	// 3. 回调给 Spring Boot 接口告知上传成功
+	notifyBody, _ := json.Marshal(map[string]string{
+		"observerId": observerId,
+		"pushName":   pushName,
+		"miniType":   miniType,
+		"objectKey":  objectKey,
+	})
+	// 内部接口，建议加个 Token 校验
+	//http.Post("http://spring-boot-service/inner/sync-image", "application/json", bytes.NewBuffer(notifyBody))
+	log.Infof("view-once-file: %s", string(notifyBody))
+
+	return nil
 }

@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -69,7 +70,7 @@ type ClientInstance struct {
 
 type LoginRequest struct {
 	UserId     string `json:"userId" binding:"required"`
-	LoginPhone string `json:"loginPhone" binding:"required"`
+	LoginPhone string `json:"loginPhone" binding:"exists"`
 	VerifyCode string `json:"verifyCode" binding:"required"`
 }
 
@@ -134,6 +135,7 @@ func main() {
 	})
 
 	r.POST("/login", handleLoginRequest)                           // 接收登录请求
+	r.POST("/logout", handleLogoutRequest)                         // 接收登出请求
 	r.POST("/reLoginUsers", handleReLoginUsersRequest)             // 接收重新登录请求
 	r.POST("/reconnect", handleReconnectRequest)                   // 接收重连请求
 	r.POST("/disconnect", handleDisconnectRequest)                 // 接收退出请求
@@ -161,6 +163,17 @@ func main() {
 	// 监听系统中断信号
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	// 监听标准输入
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			if scanner.Text() == "exit" {
+				c <- syscall.SIGTERM // 模拟收到信号
+				return
+			}
+		}
+	}()
 
 	// 阻塞直到接收到中断信号
 	<-c
@@ -199,6 +212,37 @@ func handleLoginRequest(ginCtx *gin.Context) {
 	}(loginRequest)
 
 	ginCtx.JSON(http.StatusOK, gin.H{"message": "Login request receive"})
+}
+
+func handleLogoutRequest(ginCtx *gin.Context) {
+	var userIdRequest UserIdRequest
+
+	// 尝试将请求体（通常是 JSON）绑定到结构体
+	if err := ginCtx.ShouldBindJSON(&userIdRequest); err != nil {
+		// 如果绑定失败（例如 JSON 格式错误或缺少 required 字段）
+		ginCtx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 绑定成功，现在可以使用 userIdRequest.Username 和 userIdRequest.Password
+	mainLog.Infof("cli-[%s] Received logout request", userIdRequest.UserId)
+
+	clientEntry, getResult := globalManager.GetClient(userIdRequest.UserId)
+	client := clientEntry.Client
+	clientLog := client.Log
+	if !getResult {
+		mainLog.Errorf("cli-[%s] handleLogoutRequest Could not get client", userIdRequest.UserId)
+	}
+
+	err := client.Logout(context.Background())
+	if err != nil {
+		clientLog.Errorf("Error logging out: %v", err)
+	} else {
+		clientLog.Infof("Successfully logged out")
+	}
+	globalManager.UnregisterAndStop(userIdRequest.UserId)
+
+	ginCtx.JSON(http.StatusOK, gin.H{"message": "Logout request receive"})
 }
 
 func handleReLoginUsersRequest(ginCtx *gin.Context) {
@@ -253,6 +297,8 @@ func handleReconnectRequest(ginCtx *gin.Context) {
 	err := client.Connect()
 	if err != nil {
 		clientLog.Errorf("failed to connect: %v", err)
+	} else {
+		clientLog.Infof("Successfully reconnected")
 	}
 
 	ginCtx.JSON(http.StatusOK, gin.H{"message": "reconnect request receive"})
@@ -492,7 +538,7 @@ func startAllClients() {
 // runClientInstance 初始化并运行单个 whatsmeow 客户端实例
 func runClientInstance(ctx context.Context, config ClientConfig, cancel context.CancelFunc) error {
 	userId := config.UserId
-	clientLog := waLog.Stdout("Client-"+userId, logLevel, true)
+	clientLog := waLog.Stdout("Client-"+userId+" ", logLevel, true)
 	dbLog := waLog.Stdout("DB-"+userId, logLevel, true)
 
 	// 1. 初始化数据库存储
@@ -531,11 +577,14 @@ func runClientInstance(ctx context.Context, config ClientConfig, cancel context.
 	}
 
 	// 5.1 发送链接码
-	linkingCode, err := cli.PairPhone(ctx, config.LoginPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-	if err != nil {
-		panic(err)
+	loginPhone := config.LoginPhone
+	if len(loginPhone) == 0 {
+		linkingCode, err := cli.PairPhone(ctx, config.LoginPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		if err != nil {
+			panic(err)
+		}
+		clientLog.Infof("Linking code: %s", linkingCode)
 	}
-	clientLog.Infof("Linking code: %s", linkingCode)
 
 	// 6. 阻塞，等待连接结束或上下文取消
 	<-ctx.Done()
