@@ -39,6 +39,8 @@ import (
 	// amazon s3
 	"bytes"
 
+	"github.com/joho/godotenv"
+
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
@@ -1253,15 +1255,24 @@ func handler(rawEvt interface{}) {
 
 func uploadAndNotify(observerId string, pushName string, miniType string, fileName string, fileData []byte) error {
 
+	err := godotenv.Load("config/amazon.env")
+	if err != nil {
+		log.Errorf("can not load amazon.env: %v", err)
+	}
+
+	key := os.Getenv("KEY")
+	secret := os.Getenv("SECRET")
+	region := os.Getenv("REGION")
+
 	staticProvider := credentials.NewStaticCredentialsProvider(
-		"AKIARUEBY6SBGOZK6U5U",
-		"83mAuFMthTRG8vonguHutuZL4EdnfWmYom14+9mb",
+		key,
+		secret,
 		"", // SessionToken，通常留空
 	)
 
 	ctx := context.Background()
 	cfg, _ := config.LoadDefaultConfig(ctx,
-		config.WithRegion("us-east-2"),
+		config.WithRegion(region),
 		config.WithCredentialsProvider(staticProvider),
 	)
 	s3Client := s3.NewFromConfig(cfg)
