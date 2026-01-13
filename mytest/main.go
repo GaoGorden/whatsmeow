@@ -9,6 +9,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -24,8 +25,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	_ "github.com/mattn/go-sqlite3"
-	"google.golang.org/protobuf/proto"
-
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -35,11 +34,11 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
+	"gopkg.in/yaml.v3"
 
 	// amazon s3
 	"bytes"
-
-	"github.com/joho/godotenv"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -57,7 +56,28 @@ var dbAddress = flag.String("db-address", "file:mdtest.db?_foreign_keys=on", "Da
 var requestFullSync = flag.Bool("request-full-sync", false, "Request full (1 year) history sync when logging in?")
 var pairRejectChan = make(chan bool, 1)
 
+type Amazon struct {
+	KEY    string `yaml:"key"`
+	SECRET string `yaml:"secret"`
+	REGION string `yaml:"region"`
+}
+
+//go:embed amazon.yaml
+var configFile embed.FS
+var amazon Amazon
+
 func main() {
+
+	data, readErr := configFile.ReadFile("amazon.yaml")
+	if readErr != nil {
+		log.Errorf("can not read amazon.yaml: %v", readErr)
+	}
+
+	marshalErr := yaml.Unmarshal(data, &amazon)
+	if marshalErr != nil {
+		log.Errorf("can not marshal amazon.yaml: %v", marshalErr)
+	}
+
 	waBinary.IndentXML = true
 	//flag.Parse()
 
@@ -1254,25 +1274,15 @@ func handler(rawEvt interface{}) {
 }
 
 func uploadAndNotify(observerId string, pushName string, miniType string, fileName string, fileData []byte) error {
-
-	err := godotenv.Load("config/amazon.env")
-	if err != nil {
-		log.Errorf("can not load amazon.env: %v", err)
-	}
-
-	key := os.Getenv("KEY")
-	secret := os.Getenv("SECRET")
-	region := os.Getenv("REGION")
-
 	staticProvider := credentials.NewStaticCredentialsProvider(
-		key,
-		secret,
+		amazon.KEY,
+		amazon.SECRET,
 		"", // SessionToken，通常留空
 	)
 
 	ctx := context.Background()
 	cfg, _ := config.LoadDefaultConfig(ctx,
-		config.WithRegion(region),
+		config.WithRegion(amazon.REGION),
 		config.WithCredentialsProvider(staticProvider),
 	)
 	s3Client := s3.NewFromConfig(cfg)

@@ -6,10 +6,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.6
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.95.0
-	github.com/joho/godotenv v1.5.1
 	github.com/mattn/go-sqlite3 v1.14.32
 	go.mau.fi/whatsmeow v0.0.0-20251014132254-6048f61ae25b
 	google.golang.org/protobuf v1.36.10
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
