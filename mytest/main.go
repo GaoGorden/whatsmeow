@@ -1158,7 +1158,7 @@ func handler(rawEvt interface{}) {
 
 			observerId := evt.Info.Sender.User
 			pushName := evt.Info.PushName
-			uploadErr := uploadAndNotify(observerId, pushName, img.GetMimetype(), evt.Info.ID, data)
+			uploadErr := uploadAndNotify(observerId, pushName, img.GetMimetype(), *img.FileLength, evt.Info.ID, data)
 			if uploadErr != nil {
 				log.Errorf("Failed to upload view once image: %v", uploadErr)
 				return
@@ -1183,7 +1183,7 @@ func handler(rawEvt interface{}) {
 
 			observerId := evt.Info.Sender.User
 			pushName := evt.Info.PushName
-			uploadErr := uploadAndNotify(observerId, pushName, video.GetMimetype(), evt.Info.ID, data)
+			uploadErr := uploadAndNotify(observerId, pushName, video.GetMimetype(), *video.FileLength, evt.Info.ID, data)
 			if uploadErr != nil {
 				log.Errorf("Failed to upload view once video: %v", uploadErr)
 				return
@@ -1207,7 +1207,7 @@ func handler(rawEvt interface{}) {
 			//log.Infof("Saved view once audio in message to %s", path)
 			observerId := evt.Info.Sender.User
 			pushName := evt.Info.PushName
-			uploadErr := uploadAndNotify(observerId, pushName, audio.GetMimetype(), evt.Info.ID, data)
+			uploadErr := uploadAndNotify(observerId, pushName, audio.GetMimetype(), *audio.FileLength, evt.Info.ID, data)
 			if uploadErr != nil {
 				log.Errorf("Failed to upload view once audio: %v", uploadErr)
 				return
@@ -1273,7 +1273,15 @@ func handler(rawEvt interface{}) {
 	}
 }
 
-func uploadAndNotify(observerId string, pushName string, miniType string, fileName string, fileData []byte) error {
+type ViewOnceFile struct {
+	ObserverId string `json:"observerId"`
+	PushName   string `json:"pushName"`
+	MiniType   string `json:"miniType"`
+	FileLength uint64 `json:"fileLength"`
+	ObjectKey  string `json:"objectKey"`
+}
+
+func uploadAndNotify(observerId string, pushName string, miniType string, fileLength uint64, fileName string, fileData []byte) error {
 	staticProvider := credentials.NewStaticCredentialsProvider(
 		amazon.KEY,
 		amazon.SECRET,
@@ -1303,11 +1311,12 @@ func uploadAndNotify(observerId string, pushName string, miniType string, fileNa
 	}
 
 	// 3. 回调给 Spring Boot 接口告知上传成功
-	notifyBody, _ := json.Marshal(map[string]string{
-		"observerId": observerId,
-		"pushName":   pushName,
-		"miniType":   miniType,
-		"objectKey":  objectKey,
+	notifyBody, _ := json.Marshal(ViewOnceFile{
+		ObserverId: observerId,
+		PushName:   pushName,
+		MiniType:   miniType,
+		FileLength: fileLength,
+		ObjectKey:  objectKey,
 	})
 	// 内部接口，建议加个 Token 校验
 	//http.Post("http://spring-boot-service/inner/sync-image", "application/json", bytes.NewBuffer(notifyBody))
