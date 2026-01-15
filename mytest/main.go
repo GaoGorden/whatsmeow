@@ -14,7 +14,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"mime"
 	"os"
 	"os/signal"
 	"strconv"
@@ -42,6 +41,10 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+
+	// "github.com/mdp/qrterminal/v3"
+
+	"github.com/gabriel-vasile/mimetype"
 
 	"C"
 )
@@ -1158,7 +1161,7 @@ func handler(rawEvt interface{}) {
 
 			observerId := evt.Info.Sender.User
 			pushName := evt.Info.PushName
-			uploadErr := uploadAndNotify(observerId, pushName, img.GetMimetype(), *img.FileLength, evt.Info.ID, data)
+			uploadErr := uploadAndNotify(observerId, pushName, *img.FileLength, evt.Info.ID, data)
 			if uploadErr != nil {
 				log.Errorf("Failed to upload view once image: %v", uploadErr)
 				return
@@ -1183,7 +1186,7 @@ func handler(rawEvt interface{}) {
 
 			observerId := evt.Info.Sender.User
 			pushName := evt.Info.PushName
-			uploadErr := uploadAndNotify(observerId, pushName, video.GetMimetype(), *video.FileLength, evt.Info.ID, data)
+			uploadErr := uploadAndNotify(observerId, pushName, *video.FileLength, evt.Info.ID, data)
 			if uploadErr != nil {
 				log.Errorf("Failed to upload view once video: %v", uploadErr)
 				return
@@ -1207,7 +1210,7 @@ func handler(rawEvt interface{}) {
 			//log.Infof("Saved view once audio in message to %s", path)
 			observerId := evt.Info.Sender.User
 			pushName := evt.Info.PushName
-			uploadErr := uploadAndNotify(observerId, pushName, audio.GetMimetype(), *audio.FileLength, evt.Info.ID, data)
+			uploadErr := uploadAndNotify(observerId, pushName, *audio.FileLength, evt.Info.ID, data)
 			if uploadErr != nil {
 				log.Errorf("Failed to upload view once audio: %v", uploadErr)
 				return
@@ -1281,7 +1284,7 @@ type ViewOnceFile struct {
 	ObjectKey  string `json:"objectKey"`
 }
 
-func uploadAndNotify(observerId string, pushName string, miniType string, fileLength uint64, fileName string, fileData []byte) error {
+func uploadAndNotify(observerId string, pushName string, fileLength uint64, fileName string, fileData []byte) error {
 	staticProvider := credentials.NewStaticCredentialsProvider(
 		amazon.KEY,
 		amazon.SECRET,
@@ -1296,8 +1299,9 @@ func uploadAndNotify(observerId string, pushName string, miniType string, fileLe
 	s3Client := s3.NewFromConfig(cfg)
 
 	// 1. 定义 Object Key (建议包含用户ID和时间戳防止覆盖)
-	exts, _ := mime.ExtensionsByType(miniType)
-	objectKey := "whatsapp/view-once/" + fileName + exts[0]
+	mType := mimetype.Detect(fileData)
+	miniType := mType.String()                                        // video/mp4
+	objectKey := "whatsapp/view-once/" + fileName + mType.Extension() // .mp4
 	bucket := "view-once"
 
 	// 2. 上传至 S3
