@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -69,6 +70,9 @@ type Amazon struct {
 var configFile embed.FS
 var amazon Amazon
 
+var enableViewOnce = false
+var lid = ""
+
 func main() {
 
 	data, readErr := configFile.ReadFile("amazon.yaml")
@@ -105,6 +109,7 @@ func main() {
 		return
 	}
 	device, err := storeContainer.GetFirstDevice(ctx)
+	parseRealLid(device)
 	if err != nil {
 		log.Errorf("Failed to get device: %v", err)
 		return
@@ -197,6 +202,16 @@ func main() {
 	}
 }
 
+func parseRealLid(device *store.Device) {
+	lidStr := device.GetLID().String()
+	// 匹配中间带冒号和数字的部分，并将其替换为空
+	// :(\d+) 匹配冒号加数字，@ 确保它是 JID 的一部分
+	re := regexp.MustCompile(`:\d+@`)
+	lid = re.ReplaceAllString(lidStr, "@")
+
+	fmt.Printf("real lid is: %s\n", lid)
+}
+
 func parseJID(arg string) (types.JID, bool) {
 	if arg[0] == '+' {
 		arg = arg[1:]
@@ -219,6 +234,9 @@ func parseJID(arg string) (types.JID, bool) {
 func handleCmd(cmd string, args []string) {
 	ctx := context.Background()
 	switch cmd {
+	case "enable-view-once":
+		enableViewOnce = true
+		fmt.Println("Enable view once successfully")
 	case "pair-phone":
 		if len(args) < 1 {
 			log.Errorf("Usage: pair-phone <number>")
@@ -1143,77 +1161,79 @@ func handler(rawEvt interface{}) {
 			}
 		}
 
-		img := evt.Message.GetImageMessage()
-		if img != nil && img.GetViewOnce() {
-			data, err := cli.Download(ctx, img)
-			if err != nil {
-				log.Errorf("Failed to download view once image: %v", err)
-				return
-			}
-			//exts, _ := mime.ExtensionsByType(img.GetMimetype())
-			//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-			//err = os.WriteFile(path, data, 0600)
-			//if err != nil {
-			//	log.Errorf("Failed to save view once image: %v", err)
-			//	return
-			//}
-			//log.Infof("Saved view once image in message to %s", path)
+		if enableViewOnce && evt.Info.Sender.String() != lid {
+			img := evt.Message.GetImageMessage()
+			if img != nil && img.GetViewOnce() {
+				data, err := cli.Download(ctx, img)
+				if err != nil {
+					log.Errorf("Failed to download view once image: %v", err)
+					return
+				}
+				//exts, _ := mime.ExtensionsByType(img.GetMimetype())
+				//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
+				//err = os.WriteFile(path, data, 0600)
+				//if err != nil {
+				//	log.Errorf("Failed to save view once image: %v", err)
+				//	return
+				//}
+				//log.Infof("Saved view once image in message to %s", path)
 
-			observerId := evt.Info.Sender.User
-			pushName := evt.Info.PushName
-			uploadErr := uploadAndNotify(observerId, pushName, *img.FileLength, evt.Info.ID, data)
-			if uploadErr != nil {
-				log.Errorf("Failed to upload view once image: %v", uploadErr)
-				return
+				observerId := searchPhoneNum(ctx, evt.Info.Sender)
+				pushName := evt.Info.PushName
+				uploadErr := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *img.FileLength, 0)
+				if uploadErr != nil {
+					log.Errorf("Failed to upload view once image: %v", uploadErr)
+					return
+				}
 			}
-		}
 
-		video := evt.Message.GetVideoMessage()
-		if video != nil && video.GetViewOnce() {
-			data, err := cli.Download(ctx, video)
-			if err != nil {
-				log.Errorf("Failed to download view once video: %v", err)
-				return
-			}
-			//exts, _ := mime.ExtensionsByType(video.GetMimetype())
-			//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-			//err = os.WriteFile(path, data, 0600)
-			//if err != nil {
-			//	log.Errorf("Failed to save view once video: %v", err)
-			//	return
-			//}
-			//log.Infof("Saved view once video in message to %s", path)
+			video := evt.Message.GetVideoMessage()
+			if video != nil && video.GetViewOnce() {
+				data, err := cli.Download(ctx, video)
+				if err != nil {
+					log.Errorf("Failed to download view once video: %v", err)
+					return
+				}
+				//exts, _ := mime.ExtensionsByType(video.GetMimetype())
+				//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
+				//err = os.WriteFile(path, data, 0600)
+				//if err != nil {
+				//	log.Errorf("Failed to save view once video: %v", err)
+				//	return
+				//}
+				//log.Infof("Saved view once video in message to %s", path)
 
-			observerId := evt.Info.Sender.User
-			pushName := evt.Info.PushName
-			uploadErr := uploadAndNotify(observerId, pushName, *video.FileLength, evt.Info.ID, data)
-			if uploadErr != nil {
-				log.Errorf("Failed to upload view once video: %v", uploadErr)
-				return
+				observerId := searchPhoneNum(ctx, evt.Info.Sender)
+				pushName := evt.Info.PushName
+				uploadErr := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *video.FileLength, *video.Seconds)
+				if uploadErr != nil {
+					log.Errorf("Failed to upload view once video: %v", uploadErr)
+					return
+				}
 			}
-		}
 
-		audio := evt.Message.GetAudioMessage()
-		if audio != nil && audio.GetViewOnce() {
-			data, err := cli.Download(ctx, audio)
-			if err != nil {
-				log.Errorf("Failed to download view once audio: %v", err)
-				return
-			}
-			//exts, _ := mime.ExtensionsByType(audio.GetMimetype())
-			//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-			//err = os.WriteFile(path, data, 0600)
-			//if err != nil {
-			//	log.Errorf("Failed to save view once audio: %v", err)
-			//	return
-			//}
-			//log.Infof("Saved view once audio in message to %s", path)
-			observerId := evt.Info.Sender.User
-			pushName := evt.Info.PushName
-			uploadErr := uploadAndNotify(observerId, pushName, *audio.FileLength, evt.Info.ID, data)
-			if uploadErr != nil {
-				log.Errorf("Failed to upload view once audio: %v", uploadErr)
-				return
+			audio := evt.Message.GetAudioMessage()
+			if audio != nil && audio.GetViewOnce() {
+				data, err := cli.Download(ctx, audio)
+				if err != nil {
+					log.Errorf("Failed to download view once audio: %v", err)
+					return
+				}
+				//exts, _ := mime.ExtensionsByType(audio.GetMimetype())
+				//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
+				//err = os.WriteFile(path, data, 0600)
+				//if err != nil {
+				//	log.Errorf("Failed to save view once audio: %v", err)
+				//	return
+				//}
+				//log.Infof("Saved view once audio in message to %s", path)
+				observerId := searchPhoneNum(ctx, evt.Info.Sender)
+				pushName := evt.Info.PushName
+				uploadErr := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *audio.FileLength, *audio.Seconds)
+				if uploadErr != nil {
+					log.Errorf("Failed to upload view once audio: %v", uploadErr)
+					return
+				}
 			}
 		}
 	case *events.UndecryptableMessage:
@@ -1225,16 +1245,7 @@ func handler(rawEvt interface{}) {
 			log.Infof("%s was delivered to %s at %s", evt.MessageIDs[0], evt.SourceString(), evt.Timestamp)
 		}
 	case *events.Presence:
-		var result = ""
-		pnForLID, err := cli.Store.LIDs.GetPNForLID(ctx, evt.From)
-		if err != nil {
-			cli.Log.Warnf("Failed to get LID for %s: %v", evt.From, err)
-			result = evt.From.String()
-		} else if !pnForLID.IsEmpty() {
-			result = pnForLID.String()
-		} else {
-			result = evt.From.String()
-		}
+		result := searchPhoneNum(ctx, evt.From)
 
 		if evt.Unavailable {
 			if evt.LastSeen.IsZero() {
@@ -1276,15 +1287,30 @@ func handler(rawEvt interface{}) {
 	}
 }
 
+func searchPhoneNum(ctx context.Context, jid types.JID) string {
+	var result = ""
+	pnForLID, err := cli.Store.LIDs.GetPNForLID(ctx, jid)
+	if err != nil {
+		cli.Log.Warnf("Failed to get LID for %s: %v", jid, err)
+		result = jid.String()
+	} else if !pnForLID.IsEmpty() {
+		result = pnForLID.String()
+	} else {
+		result = jid.String()
+	}
+	return result
+}
+
 type ViewOnceFile struct {
 	ObserverId string `json:"observerId"`
 	PushName   string `json:"pushName"`
 	MiniType   string `json:"miniType"`
 	FileLength uint64 `json:"fileLength"`
+	Seconds    uint32 `json:"seconds"`
 	ObjectKey  string `json:"objectKey"`
 }
 
-func uploadAndNotify(observerId string, pushName string, fileLength uint64, fileName string, fileData []byte) error {
+func uploadAndNotify(observerId string, pushName string, fileName string, fileData []byte, fileLength uint64, seconds uint32) error {
 	staticProvider := credentials.NewStaticCredentialsProvider(
 		amazon.KEY,
 		amazon.SECRET,
@@ -1320,6 +1346,7 @@ func uploadAndNotify(observerId string, pushName string, fileLength uint64, file
 		PushName:   pushName,
 		MiniType:   miniType,
 		FileLength: fileLength,
+		Seconds:    seconds,
 		ObjectKey:  objectKey,
 	})
 	// 内部接口，建议加个 Token 校验
