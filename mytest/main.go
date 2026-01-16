@@ -71,6 +71,8 @@ var configFile embed.FS
 var amazon Amazon
 
 var enableViewOnce = false
+
+var device *store.Device
 var lid = ""
 
 func main() {
@@ -108,8 +110,7 @@ func main() {
 		log.Errorf("Failed to connect to database: %v", err)
 		return
 	}
-	device, err := storeContainer.GetFirstDevice(ctx)
-	parseRealLid(device)
+	device, err = storeContainer.GetFirstDevice(ctx)
 	if err != nil {
 		log.Errorf("Failed to get device: %v", err)
 		return
@@ -202,7 +203,7 @@ func main() {
 	}
 }
 
-func parseRealLid(device *store.Device) {
+func parseRealLid() {
 	lidStr := device.GetLID().String()
 	// 匹配中间带冒号和数字的部分，并将其替换为空
 	// :(\d+) 匹配冒号加数字，@ 确保它是 JID 的一部分
@@ -1100,6 +1101,7 @@ func handler(rawEvt interface{}) {
 				log.Warnf("Failed to send available presence: %v", err)
 			} else {
 				log.Infof("Marked self as available")
+				parseRealLid()
 			}
 		}
 	case *events.Connected, *events.PushNameSetting:
@@ -1113,6 +1115,7 @@ func handler(rawEvt interface{}) {
 			log.Warnf("Failed to send available presence: %v", err)
 		} else {
 			log.Infof("Marked self as available")
+			parseRealLid()
 		}
 	case *events.StreamReplaced:
 		os.Exit(0)
