@@ -104,7 +104,8 @@ func SetWAVersion(version WAVersionContainer) {
 
 var BaseClientPayload = &waWa6.ClientPayload{
 	UserAgent: &waWa6.ClientPayload_UserAgent{
-		Platform:       waWa6.ClientPayload_UserAgent_ANDROID.Enum(),
+		Platform: waWa6.ClientPayload_UserAgent_MACOS.Enum(),
+		//Platform:       waWa6.ClientPayload_UserAgent_ANDROID.Enum(),
 		ReleaseChannel: waWa6.ClientPayload_UserAgent_RELEASE.Enum(),
 		AppVersion:     waVersion.ProtoAppVersion(),
 		Mcc:            proto.String("000"),
@@ -150,7 +151,8 @@ var DeviceProps = &waCompanionReg.DeviceProps{
 		CompleteOnDemandReady:                    nil,
 		ThumbnailSyncDaysLimit:                   nil,
 	},
-	PlatformType:    waCompanionReg.DeviceProps_UNKNOWN.Enum(),
+	PlatformType: waCompanionReg.DeviceProps_CHROME.Enum(),
+	//PlatformType:    waCompanionReg.DeviceProps_UNKNOWN.Enum(),
 	RequireFullSync: proto.Bool(false),
 }
 
