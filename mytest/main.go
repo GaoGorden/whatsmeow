@@ -1164,6 +1164,30 @@ func handler(rawEvt interface{}) {
 			}
 		}
 
+		// todo 群组消息 预研
+		//if evt.Info.Sender != evt.Info.Chat {
+		//	groupInfo, err := cli.GetGroupInfo(ctx, evt.Info.Chat)
+		//	if err == nil {
+		//		fmt.Printf("收到群组消息！群名: %s\n", groupInfo.Name)
+		//	}
+		//	fmt.Println("current message is in group, group info: " + evt.Info.Chat.String())
+		//
+		//	imgInfo, picErr := cli.GetProfilePictureInfo(ctx, evt.Info.Chat, &whatsmeow.GetProfilePictureParams{
+		//		Preview: false,
+		//	})
+		//
+		//	if picErr != nil {
+		//		if errors.Is(picErr, whatsmeow.ErrProfilePictureNotSet) {
+		//			fmt.Println("该群组未设置头像")
+		//		} else {
+		//			fmt.Printf("获取头像失败: %v\n", picErr)
+		//		}
+		//		return
+		//	}
+		//
+		//	fmt.Printf("头像下载链接: %s\n", imgInfo.URL)
+		//}
+
 		if enableViewOnce && evt.Info.Sender.String() != lid {
 			img := evt.Message.GetImageMessage()
 			if img != nil && img.GetViewOnce() {
@@ -1182,7 +1206,11 @@ func handler(rawEvt interface{}) {
 				//log.Infof("Saved view once image in message to %s", path)
 
 				observerId := searchPhoneNum(ctx, evt.Info.Sender)
-				pushName := evt.Info.PushName
+				pushName := getNickName(ctx, evt.Info.Sender)
+				if pushName == "" {
+					pushName = evt.Info.PushName
+				}
+
 				uploadErr := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *img.FileLength, 0)
 				if uploadErr != nil {
 					log.Errorf("Failed to upload view once image: %v", uploadErr)
@@ -1207,7 +1235,11 @@ func handler(rawEvt interface{}) {
 				//log.Infof("Saved view once video in message to %s", path)
 
 				observerId := searchPhoneNum(ctx, evt.Info.Sender)
-				pushName := evt.Info.PushName
+				pushName := getNickName(ctx, evt.Info.Sender)
+				if pushName == "" {
+					pushName = evt.Info.PushName
+				}
+
 				uploadErr := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *video.FileLength, *video.Seconds)
 				if uploadErr != nil {
 					log.Errorf("Failed to upload view once video: %v", uploadErr)
@@ -1231,7 +1263,11 @@ func handler(rawEvt interface{}) {
 				//}
 				//log.Infof("Saved view once audio in message to %s", path)
 				observerId := searchPhoneNum(ctx, evt.Info.Sender)
-				pushName := evt.Info.PushName
+				pushName := getNickName(ctx, evt.Info.Sender)
+				if pushName == "" {
+					pushName = evt.Info.PushName
+				}
+
 				uploadErr := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *audio.FileLength, *audio.Seconds)
 				if uploadErr != nil {
 					log.Errorf("Failed to upload view once audio: %v", uploadErr)
@@ -1290,6 +1326,24 @@ func handler(rawEvt interface{}) {
 	}
 }
 
+func getNickName(ctx context.Context, sender types.JID) string {
+	nickName := ""
+	jid := searchJid(ctx, sender)
+	contact, err := cli.Store.Contacts.GetContact(ctx, jid)
+	if err != nil {
+		log.Errorf("GetContact fail: %v", err)
+	} else {
+		fmt.Println("全名:", contact.FullName)
+		fmt.Println("推送昵称:", contact.PushName)
+	}
+	if contact.FullName != "" {
+		nickName = contact.FullName
+	} else {
+		nickName = contact.PushName
+	}
+	return nickName
+}
+
 func searchPhoneNum(ctx context.Context, jid types.JID) string {
 	var result = ""
 	pnForLID, err := cli.Store.LIDs.GetPNForLID(ctx, jid)
@@ -1302,6 +1356,14 @@ func searchPhoneNum(ctx context.Context, jid types.JID) string {
 		result = jid.String()
 	}
 	return result
+}
+
+func searchJid(ctx context.Context, jid types.JID) types.JID {
+	pnForLID, err := cli.Store.LIDs.GetPNForLID(ctx, jid)
+	if err != nil {
+		cli.Log.Warnf("Failed to get LID for %s: %v", jid, err)
+	}
+	return pnForLID
 }
 
 type ViewOnceFile struct {
@@ -1329,8 +1391,8 @@ func uploadAndNotify(observerId string, pushName string, fileName string, fileDa
 
 	// 1. 定义 Object Key (建议包含用户ID和时间戳防止覆盖)
 	mType := mimetype.Detect(fileData)
-	miniType := mType.String()                                        // video/mp4
-	objectKey := "whatsapp/view-once/" + fileName + mType.Extension() // .mp4
+	miniType := mType.String()                                                                            // video/mp4
+	objectKey := "whatsapp/view-once/" + cli.Store.GetJID().String() + "/" + fileName + mType.Extension() // .mp4
 	bucket := "view-once"
 
 	// 2. 上传至 S3
