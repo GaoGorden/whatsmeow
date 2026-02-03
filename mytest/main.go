@@ -1344,24 +1344,30 @@ func getNickName(ctx context.Context, sender types.JID) string {
 	return nickName
 }
 
-func searchPhoneNum(ctx context.Context, jid types.JID) string {
+func searchPhoneNum(ctx context.Context, lid types.JID) string {
+	if !strings.Contains(lid.String(), "@lid") {
+		return lid.String()
+	}
 	var result = ""
-	pnForLID, err := cli.Store.LIDs.GetPNForLID(ctx, jid)
+	pnForLID, err := cli.Store.LIDs.GetPNForLID(ctx, lid)
 	if err != nil {
-		cli.Log.Warnf("Failed to get LID for %s: %v", jid, err)
-		result = jid.String()
+		cli.Log.Warnf("Failed to get LID for %s: %v", lid, err)
+		result = lid.String()
 	} else if !pnForLID.IsEmpty() {
 		result = pnForLID.String()
 	} else {
-		result = jid.String()
+		result = lid.String()
 	}
 	return result
 }
 
-func searchJid(ctx context.Context, jid types.JID) types.JID {
-	pnForLID, err := cli.Store.LIDs.GetPNForLID(ctx, jid)
+func searchJid(ctx context.Context, lid types.JID) types.JID {
+	if !strings.Contains(lid.String(), "@lid") {
+		return lid
+	}
+	pnForLID, err := cli.Store.LIDs.GetPNForLID(ctx, lid)
 	if err != nil {
-		cli.Log.Warnf("Failed to get LID for %s: %v", jid, err)
+		cli.Log.Warnf("Failed to get LID for %s: %v", lid, err)
 	}
 	return pnForLID
 }
