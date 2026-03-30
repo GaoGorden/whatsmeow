@@ -238,6 +238,9 @@ func handleCmd(cmd string, args []string) {
 	case "enable-view-once":
 		enableViewOnce = true
 		fmt.Println("Enable view once successfully")
+	case "disable-view-once":
+		enableViewOnce = false
+		fmt.Println("Disable view once successfully")
 	case "pair-phone":
 		if len(args) < 1 {
 			log.Errorf("Usage: pair-phone <number>")
