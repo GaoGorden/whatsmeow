@@ -43,7 +43,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	// "github.com/mdp/qrterminal/v3"
+	//"github.com/mdp/qrterminal/v3"
 
 	"github.com/gabriel-vasile/mimetype"
 
@@ -154,13 +154,16 @@ func main() {
 	//}
 
 	cli.AddEventHandler(handler)
-	err = cli.Connect()
-	if err != nil {
-		log.Errorf("Failed to connect: %v", err)
-		return
+	if device.ID != nil {
+		err = cli.Connect()
+		if err != nil {
+			log.Errorf("Failed to connect: %v", err)
+			return
+		}
+		log.Infof("Client is ready")
+	} else {
+		log.Infof("Device not logged in. Use 'require-qrcode' or 'pair-phone' to log in.")
 	}
-
-	log.Infof("Client is ready")
 
 	c := make(chan os.Signal, 1)
 	input := make(chan string)
@@ -246,11 +249,47 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: pair-phone <number>")
 			return
 		}
+		if !cli.IsConnected() {
+			err := cli.Connect()
+			if err != nil {
+				log.Errorf("Failed to connect: %v", err)
+				return
+			}
+			log.Infof("Client is ready, waiting for QR event...")
+			time.Sleep(2 * time.Second)
+		}
 		linkingCode, err := cli.PairPhone(ctx, args[0], true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if err != nil {
 			panic(err)
 		}
 		fmt.Println("Linking code:", linkingCode)
+	case "require-qrcode":
+		if cli.IsConnected() {
+			log.Errorf("Already connected, can't start QR login")
+			return
+		}
+		qrChan, err := cli.GetQRChannel(context.Background())
+		if err != nil {
+			log.Errorf("Failed to get QR channel: %v", err)
+			return
+		}
+		go func() {
+			for evt := range qrChan {
+				if evt.Event == whatsmeow.QRChannelEventCode {
+					fmt.Println("QR code:", evt.Code)
+					fmt.Println("timeout=", evt.Timeout)
+					//qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else {
+					log.Infof("QR channel result: %s", evt.Event)
+				}
+			}
+		}()
+		err = cli.Connect()
+		if err != nil {
+			log.Errorf("Failed to connect: %v", err)
+		} else {
+			log.Infof("Client is ready")
+		}
 	case "reconnect":
 		cli.Disconnect()
 		err := cli.Connect()
