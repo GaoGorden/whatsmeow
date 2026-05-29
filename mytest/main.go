@@ -216,6 +216,11 @@ func parseRealLid() {
 	fmt.Printf("real lid is: %s\n", lid)
 }
 
+func printUserInfo() {
+	fmt.Printf("push name is: %s\n", cli.Store.PushName)
+	fmt.Printf("phone number is: %s\n", cli.Store.ID.ToNonAD().User)
+}
+
 func parseJID(arg string) (types.JID, bool) {
 	if arg[0] == '+' {
 		arg = arg[1:]
@@ -255,8 +260,8 @@ func handleCmd(cmd string, args []string) {
 				log.Errorf("Failed to connect: %v", err)
 				return
 			}
-			log.Infof("Client is ready, waiting for QR event...")
-			time.Sleep(2 * time.Second)
+			log.Infof("Client is ready")
+			//time.Sleep(2 * time.Second)
 		}
 		linkingCode, err := cli.PairPhone(ctx, args[0], true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if err != nil {
@@ -1142,6 +1147,7 @@ func handler(rawEvt interface{}) {
 			if err != nil {
 				log.Warnf("Failed to send available presence: %v", err)
 			} else {
+				printUserInfo()
 				log.Infof("Marked self as available")
 				parseRealLid()
 			}
@@ -1156,6 +1162,7 @@ func handler(rawEvt interface{}) {
 		if err != nil {
 			log.Warnf("Failed to send available presence: %v", err)
 		} else {
+			printUserInfo()
 			log.Infof("Marked self as available")
 			parseRealLid()
 		}
