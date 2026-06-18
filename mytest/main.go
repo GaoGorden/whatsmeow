@@ -52,6 +52,7 @@ import (
 
 var cli *whatsmeow.Client
 var log waLog.Logger
+var s3Client *s3.Client
 
 var logLevel = "INFO"
 var debugLogs = flag.Bool("debug", false, "Enable debug logs?")
@@ -86,6 +87,17 @@ func main() {
 	if marshalErr != nil {
 		log.Errorf("can not marshal amazon.yaml: %v", marshalErr)
 	}
+
+	staticProvider := credentials.NewStaticCredentialsProvider(
+		amazon.KEY,
+		amazon.SECRET,
+		"",
+	)
+	cfg, _ := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion(amazon.REGION),
+		config.WithCredentialsProvider(staticProvider),
+	)
+	s3Client = s3.NewFromConfig(cfg)
 
 	waBinary.IndentXML = true
 	//flag.Parse()
@@ -1240,88 +1252,59 @@ func handler(rawEvt interface{}) {
 		if enableViewOnce && evt.Info.Sender.String() != lid {
 			img := evt.Message.GetImageMessage()
 			if img != nil && img.GetViewOnce() {
-				data, err := cli.Download(ctx, img)
-				if err != nil {
-					log.Errorf("Failed to download view once image: %v", err)
-					return
-				}
-				//exts, _ := mime.ExtensionsByType(img.GetMimetype())
-				//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-				//err = os.WriteFile(path, data, 0600)
-				//if err != nil {
-				//	log.Errorf("Failed to save view once image: %v", err)
-				//	return
-				//}
-				//log.Infof("Saved view once image in message to %s", path)
-
 				observerId := searchPhoneNum(ctx, evt.Info.Sender)
 				pushName := getNickName(ctx, evt.Info.Sender)
 				if pushName == "" {
 					pushName = evt.Info.PushName
 				}
-
-				uploadErr := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *img.FileLength, 0)
-				if uploadErr != nil {
-					log.Errorf("Failed to upload view once image: %v", uploadErr)
-					return
-				}
+				go func() {
+					data, err := cli.Download(ctx, img)
+					if err != nil {
+						log.Errorf("Failed to download view once image: %v", err)
+						return
+					}
+					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *img.FileLength, 0); err != nil {
+						log.Errorf("Failed to upload view once image: %v", err)
+					}
+				}()
 			}
 
 			video := evt.Message.GetVideoMessage()
 			if video != nil && video.GetViewOnce() {
-				data, err := cli.Download(ctx, video)
-				if err != nil {
-					log.Errorf("Failed to download view once video: %v", err)
-					return
-				}
-				//exts, _ := mime.ExtensionsByType(video.GetMimetype())
-				//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-				//err = os.WriteFile(path, data, 0600)
-				//if err != nil {
-				//	log.Errorf("Failed to save view once video: %v", err)
-				//	return
-				//}
-				//log.Infof("Saved view once video in message to %s", path)
-
 				observerId := searchPhoneNum(ctx, evt.Info.Sender)
 				pushName := getNickName(ctx, evt.Info.Sender)
 				if pushName == "" {
 					pushName = evt.Info.PushName
 				}
-
-				uploadErr := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *video.FileLength, *video.Seconds)
-				if uploadErr != nil {
-					log.Errorf("Failed to upload view once video: %v", uploadErr)
-					return
-				}
+				go func() {
+					data, err := cli.Download(ctx, video)
+					if err != nil {
+						log.Errorf("Failed to download view once video: %v", err)
+						return
+					}
+					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *video.FileLength, *video.Seconds); err != nil {
+						log.Errorf("Failed to upload view once video: %v", err)
+					}
+				}()
 			}
 
 			audio := evt.Message.GetAudioMessage()
 			if audio != nil && audio.GetViewOnce() {
-				data, err := cli.Download(ctx, audio)
-				if err != nil {
-					log.Errorf("Failed to download view once audio: %v", err)
-					return
-				}
-				//exts, _ := mime.ExtensionsByType(audio.GetMimetype())
-				//path := fmt.Sprintf("%s%s", evt.Info.ID, exts[0])
-				//err = os.WriteFile(path, data, 0600)
-				//if err != nil {
-				//	log.Errorf("Failed to save view once audio: %v", err)
-				//	return
-				//}
-				//log.Infof("Saved view once audio in message to %s", path)
 				observerId := searchPhoneNum(ctx, evt.Info.Sender)
 				pushName := getNickName(ctx, evt.Info.Sender)
 				if pushName == "" {
 					pushName = evt.Info.PushName
 				}
-
-				uploadErr := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *audio.FileLength, *audio.Seconds)
-				if uploadErr != nil {
-					log.Errorf("Failed to upload view once audio: %v", uploadErr)
-					return
-				}
+				go func() {
+					data, err := cli.Download(ctx, audio)
+					if err != nil {
+						log.Errorf("Failed to download view once audio: %v", err)
+						return
+					}
+					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *audio.FileLength, *audio.Seconds); err != nil {
+						log.Errorf("Failed to upload view once audio: %v", err)
+					}
+				}()
 			}
 		}
 	case *events.UndecryptableMessage:
@@ -1431,26 +1414,12 @@ type ViewOnceFile struct {
 }
 
 func uploadAndNotify(observerId string, pushName string, fileName string, fileData []byte, fileLength uint64, seconds uint32) error {
-	staticProvider := credentials.NewStaticCredentialsProvider(
-		amazon.KEY,
-		amazon.SECRET,
-		"", // SessionToken，通常留空
-	)
-
 	ctx := context.Background()
-	cfg, _ := config.LoadDefaultConfig(ctx,
-		config.WithRegion(amazon.REGION),
-		config.WithCredentialsProvider(staticProvider),
-	)
-	s3Client := s3.NewFromConfig(cfg)
-
-	// 1. 定义 Object Key (建议包含用户ID和时间戳防止覆盖)
 	mType := mimetype.Detect(fileData)
-	miniType := mType.String()                                                                            // video/mp4
-	objectKey := "whatsapp/view-once/" + cli.Store.GetJID().String() + "/" + fileName + mType.Extension() // .mp4
+	miniType := mType.String()
+	objectKey := "whatsapp/view-once/" + cli.Store.GetJID().String() + "/" + fileName + mType.Extension()
 	bucket := "view-once"
 
-	// 2. 上传至 S3
 	_, err := s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &objectKey,
