@@ -1159,7 +1159,7 @@ func handler(rawEvt interface{}) {
 			if err != nil {
 				log.Warnf("Failed to send available presence: %v", err)
 			} else {
-				printUserInfo()
+				//printUserInfo()
 				log.Infof("Marked self as available")
 				parseRealLid()
 			}
@@ -1174,7 +1174,7 @@ func handler(rawEvt interface{}) {
 		if err != nil {
 			log.Warnf("Failed to send available presence: %v", err)
 		} else {
-			printUserInfo()
+			//printUserInfo()
 			log.Infof("Marked self as available")
 			parseRealLid()
 		}
