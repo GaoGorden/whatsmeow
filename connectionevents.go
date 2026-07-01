@@ -226,6 +226,13 @@ func (cli *Client) SetPassive(ctx context.Context, passive bool) error {
 }
 
 func printUserInfo(cli *Client) {
-	fmt.Printf("push name is: %s\n", cli.Store.PushName)
+	pushName := cli.Store.PushName
+	if pushName == "" {
+		contact, err := cli.Store.Contacts.GetContact(context.TODO(), *cli.Store.ID)
+		if err == nil {
+			pushName = contact.PushName
+		}
+	}
+	fmt.Printf("push name is: %s\n", pushName)
 	fmt.Printf("phone number is: %s\n", cli.Store.ID.ToNonAD().User)
 }

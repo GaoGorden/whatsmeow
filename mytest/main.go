@@ -25,6 +25,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	_ "github.com/mattn/go-sqlite3"
+	//"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -42,8 +43,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-
-	//"github.com/mdp/qrterminal/v3"
 
 	"github.com/gabriel-vasile/mimetype"
 
@@ -229,7 +228,14 @@ func parseRealLid() {
 }
 
 func printUserInfo() {
-	fmt.Printf("push name is: %s\n", cli.Store.PushName)
+	pushName := cli.Store.PushName
+	if pushName == "" {
+		contact, err := cli.Store.Contacts.GetContact(context.TODO(), *cli.Store.ID)
+		if err == nil {
+			pushName = contact.PushName
+		}
+	}
+	fmt.Printf("push name is: %s\n", pushName)
 	fmt.Printf("phone number is: %s\n", cli.Store.ID.ToNonAD().User)
 }
 
@@ -1159,7 +1165,7 @@ func handler(rawEvt interface{}) {
 			if err != nil {
 				log.Warnf("Failed to send available presence: %v", err)
 			} else {
-				//printUserInfo()
+				printUserInfo()
 				log.Infof("Marked self as available")
 				parseRealLid()
 			}
@@ -1174,7 +1180,7 @@ func handler(rawEvt interface{}) {
 		if err != nil {
 			log.Warnf("Failed to send available presence: %v", err)
 		} else {
-			//printUserInfo()
+			printUserInfo()
 			log.Infof("Marked self as available")
 			parseRealLid()
 		}
