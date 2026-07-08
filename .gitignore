@@ -1,3 +1,6 @@
 /mdtest.db
 /output/
 /mytest/amazon.yaml
+history-*.json
+
+.claude

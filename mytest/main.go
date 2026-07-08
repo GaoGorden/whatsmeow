@@ -235,8 +235,8 @@ func printUserInfo() {
 			pushName = contact.PushName
 		}
 	}
-	fmt.Printf("push name is: %s\n", pushName)
-	fmt.Printf("phone number is: %s\n", cli.Store.ID.ToNonAD().User)
+	ProtoOutput(MsgPushName, map[string]any{"name": pushName})
+	ProtoOutput(MsgPhoneNumber, map[string]any{"number": cli.Store.ID.ToNonAD().User})
 }
 
 func parseJID(arg string) (types.JID, bool) {
@@ -263,10 +263,10 @@ func handleCmd(cmd string, args []string) {
 	switch cmd {
 	case "enable-view-once":
 		enableViewOnce = true
-		fmt.Println("Enable view once successfully")
+		ProtoOutput(MsgViewOnceEnabled, map[string]any{"enabled": true})
 	case "disable-view-once":
 		enableViewOnce = false
-		fmt.Println("Disable view once successfully")
+		ProtoOutput(MsgViewOnceEnabled, map[string]any{"enabled": false})
 	case "pair-phone":
 		if len(args) < 1 {
 			log.Errorf("Usage: pair-phone <number>")
@@ -283,9 +283,10 @@ func handleCmd(cmd string, args []string) {
 		}
 		linkingCode, err := cli.PairPhone(ctx, args[0], true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if err != nil {
-			panic(err)
+			ProtoOutput(MsgPairError, map[string]any{"error": err.Error()})
+			return
 		}
-		fmt.Println("Linking code:", linkingCode)
+		ProtoOutput(MsgLinkingCode, map[string]any{"code": linkingCode})
 	case "require-qrcode":
 		if cli.IsConnected() {
 			log.Errorf("Already connected, can't start QR login")
@@ -299,11 +300,12 @@ func handleCmd(cmd string, args []string) {
 		go func() {
 			for evt := range qrChan {
 				if evt.Event == whatsmeow.QRChannelEventCode {
-					fmt.Println("QR code:", evt.Code)
-					fmt.Println("timeout=", evt.Timeout)
-					//qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					ProtoOutput(MsgQrCode, map[string]any{"code": evt.Code})
 				} else {
 					log.Infof("QR channel result: %s", evt.Event)
+					if evt.Event == whatsmeow.QRChannelTimeout.Event {
+						ProtoOutput(MsgQrTimeout, map[string]any{})
+					}
 				}
 			}
 		}()
@@ -324,7 +326,7 @@ func handleCmd(cmd string, args []string) {
 		if err != nil {
 			log.Errorf("Error logging out: %v", err)
 		} else {
-			log.Infof("Successfully logged out")
+			ProtoOutput(MsgLogoutSuccess, map[string]any{})
 		}
 	case "appstate":
 		if len(args) < 1 {
@@ -385,14 +387,18 @@ func handleCmd(cmd string, args []string) {
 		}
 		resp, err := cli.IsOnWhatsApp(ctx, args)
 		if err != nil {
-			log.Errorf("Failed to check if users are on WhatsApp:", err)
+			log.Errorf("Failed to check if users are on WhatsApp: %v", err)
 		} else {
 			for _, item := range resp {
-				if item.VerifiedName != nil {
-					log.Infof("%s: on whatsapp: %t, JID: %s, business name: %s", item.Query, item.IsIn, item.JID, item.VerifiedName.Details.GetVerifiedName())
-				} else {
-					log.Infof("%s: on whatsapp: %t, JID: %s", item.Query, item.IsIn, item.JID)
+				data := map[string]any{
+					"query": item.Query,
+					"isIn":  item.IsIn,
+					"jid":   searchPhoneNum(ctx, item.JID),
 				}
+				if item.VerifiedName != nil {
+					data["businessName"] = item.VerifiedName.Details.GetVerifiedName()
+				}
+				ProtoOutput(MsgCheckUser, data)
 			}
 		}
 	//case "checkupdate":
@@ -610,13 +616,12 @@ func handleCmd(cmd string, args []string) {
 			ExistingID:  existingID,
 		})
 		if err != nil {
-			//log.Errorf("Failed to get avatar: %v", err)
-			log.Infof("Failed to get avatar: %s", jid)
+			log.Errorf("Failed to get avatar for %s: %v", jid, err)
+			ProtoOutput(MsgGetAvatarFail, map[string]any{"jid": searchPhoneNum(ctx, jid)})
 		} else if pic != nil {
-			//log.Infof("Got avatar ID %s: %s", pic.ID, pic.URL)
-			log.Infof("Got avatar success %s: %sAVATAREND", jid, pic.URL)
+			ProtoOutput(MsgGetAvatar, map[string]any{"jid": searchPhoneNum(ctx, jid), "url": pic.URL})
 		} else {
-			log.Infof("No avatar found")
+			ProtoOutput(MsgGetAvatarFail, map[string]any{"jid": searchPhoneNum(ctx, jid)})
 		}
 	case "getgroup":
 		if len(args) < 1 {
@@ -1166,7 +1171,7 @@ func handler(rawEvt interface{}) {
 				log.Warnf("Failed to send available presence: %v", err)
 			} else {
 				printUserInfo()
-				log.Infof("Marked self as available")
+				ProtoOutput(MsgLoginSuccess, map[string]any{})
 				parseRealLid()
 			}
 		}
@@ -1181,7 +1186,7 @@ func handler(rawEvt interface{}) {
 			log.Warnf("Failed to send available presence: %v", err)
 		} else {
 			printUserInfo()
-			log.Infof("Marked self as available")
+			ProtoOutput(MsgLoginSuccess, map[string]any{})
 			parseRealLid()
 		}
 	case *events.StreamReplaced:
@@ -1210,7 +1215,13 @@ func handler(rawEvt interface{}) {
 			metaParts = append(metaParts, "edit")
 		}
 
-		log.Infof("Received message %s from %s (%s): %+v", evt.Info.ID, evt.Info.SourceString(), strings.Join(metaParts, ", "), evt.Message)
+		// Debug log without JID to prevent keyword false-matching in Java parser
+		log.Debugf("Received message %s (%s)", evt.Info.ID, strings.Join(metaParts, ", "))
+		// Protocol output for Java Server (only useful metadata, no message body)
+		ProtoOutput(MsgReceivedMessage, map[string]any{
+			"msgId": evt.Info.ID,
+			"jid":   searchPhoneNum(ctx, evt.Info.Sender),
+		})
 
 		if evt.Message.GetPollUpdateMessage() != nil {
 			decrypted, err := cli.DecryptPollVote(ctx, evt)
@@ -1317,24 +1328,35 @@ func handler(rawEvt interface{}) {
 		log.Infof("Received undecryptableMessage %s from %s (%s): %+v", evt.Info.ID, evt.Info.SourceString())
 	case *events.Receipt:
 		if evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypeReadSelf {
-			log.Infof("%v was read by %s at %s", evt.MessageIDs, evt.SourceString(), evt.Timestamp)
+			msgIds := make([]string, len(evt.MessageIDs))
+			for i, id := range evt.MessageIDs {
+				msgIds[i] = id
+			}
+			ProtoOutput(MsgReadReceipt, map[string]any{
+				"jid":        searchPhoneNum(ctx, evt.Sender),
+				"messageIds": msgIds,
+				"timestamp":  evt.Timestamp.Format("2006/01/02 15:04:05"),
+			})
 		} else if evt.Type == types.ReceiptTypeDelivered {
-			log.Infof("%s was delivered to %s at %s", evt.MessageIDs[0], evt.SourceString(), evt.Timestamp)
+			log.Debugf("%s was delivered to %s at %s", evt.MessageIDs[0], evt.SourceString(), evt.Timestamp)
 		}
 	case *events.Presence:
 		result := searchPhoneNum(ctx, evt.From)
 
 		if evt.Unavailable {
-			if evt.LastSeen.IsZero() {
-				//log.Infof("%s is now offline", evt.From)
-				log.Infof("offline: %s", result)
-			} else {
-				//log.Infof("%s is now offline (last seen: %s)", evt.From, evt.LastSeen)
-				log.Infof("offline: %s", result, evt.LastSeen)
+			data := map[string]any{
+				"state": "offline",
+				"jid":   result,
 			}
+			if !evt.LastSeen.IsZero() {
+				data["lastSeen"] = evt.LastSeen.Format("2006/01/02 15:04:05")
+			}
+			ProtoOutput(MsgPresence, data)
 		} else {
-			//log.Infof("%s is now online", evt.From)
-			log.Infof("online: %s", result)
+			ProtoOutput(MsgPresence, map[string]any{
+				"state": "online",
+				"jid":   result,
+			})
 		}
 	case *events.HistorySync:
 		id := atomic.AddInt32(&historySyncID, 1)
@@ -1370,9 +1392,6 @@ func getNickName(ctx context.Context, sender types.JID) string {
 	contact, err := cli.Store.Contacts.GetContact(ctx, jid)
 	if err != nil {
 		log.Errorf("GetContact fail: %v", err)
-	} else {
-		fmt.Println("全名:", contact.FullName)
-		fmt.Println("推送昵称:", contact.PushName)
 	}
 	if contact.FullName != "" {
 		nickName = contact.FullName
@@ -1410,15 +1429,6 @@ func searchJid(ctx context.Context, lid types.JID) types.JID {
 	return pnForLID
 }
 
-type ViewOnceFile struct {
-	ObserverId string `json:"observerId"`
-	PushName   string `json:"pushName"`
-	MiniType   string `json:"miniType"`
-	FileLength uint64 `json:"fileLength"`
-	Seconds    uint32 `json:"seconds"`
-	ObjectKey  string `json:"objectKey"`
-}
-
 func uploadAndNotify(observerId string, pushName string, fileName string, fileData []byte, fileLength uint64, seconds uint32) error {
 	ctx := context.Background()
 	mType := mimetype.Detect(fileData)
@@ -1435,18 +1445,15 @@ func uploadAndNotify(observerId string, pushName string, fileName string, fileDa
 		return err
 	}
 
-	// 3. 回调给 Spring Boot 接口告知上传成功
-	notifyBody, _ := json.Marshal(ViewOnceFile{
-		ObserverId: observerId,
-		PushName:   pushName,
-		MiniType:   miniType,
-		FileLength: fileLength,
-		Seconds:    seconds,
-		ObjectKey:  objectKey,
+	// 3. 通过协议输出通知 Java Server
+	ProtoOutput(MsgViewOnceFile, map[string]any{
+		"observerId": observerId,
+		"pushName":   pushName,
+		"miniType":   miniType,
+		"fileLength": fileLength,
+		"seconds":    seconds,
+		"objectKey":  objectKey,
 	})
-	// 内部接口，建议加个 Token 校验
-	//http.Post("http://spring-boot-service/inner/sync-image", "application/json", bytes.NewBuffer(notifyBody))
-	log.Infof("view-once-file: %s", string(notifyBody))
 
 	return nil
 }
