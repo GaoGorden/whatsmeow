@@ -144,6 +144,11 @@ func main() {
 		log.Infof("Accepting pair")
 		return true
 	}
+	cli.OnLoginSuccess = func() {
+		printUserInfo()
+		ProtoOutput(MsgLoginSuccess, map[string]any{})
+		parseRealLid()
+	}
 
 	//ch, err := cli.GetQRChannel(context.Background())
 	//if err != nil {
@@ -1169,26 +1174,30 @@ func handler(rawEvt interface{}) {
 			err := cli.SendPresence(ctx, types.PresenceAvailable)
 			if err != nil {
 				log.Warnf("Failed to send available presence: %v", err)
-			} else {
-				printUserInfo()
-				ProtoOutput(MsgLoginSuccess, map[string]any{})
-				parseRealLid()
 			}
 		}
-	case *events.Connected, *events.PushNameSetting:
+	case *events.Connected:
 		if len(cli.Store.PushName) == 0 {
 			return
 		}
-		// Send presence available when connecting and when the pushname is changed.
+		// Send presence available when connecting.
 		// This makes sure that outgoing messages always have the right pushname.
+		// MsgLoginSuccess is now sent earlier via OnLoginSuccess callback in handleConnectSuccess.
 		err := cli.SendPresence(ctx, types.PresenceAvailable)
 		if err != nil {
 			log.Warnf("Failed to send available presence: %v", err)
-		} else {
-			printUserInfo()
-			ProtoOutput(MsgLoginSuccess, map[string]any{})
-			parseRealLid()
 		}
+	case *events.PushNameSetting:
+		// Pushname changed mid-session: re-send presence to update server,
+		// notify Java of new nickname. Not a login event.
+		if len(cli.Store.PushName) == 0 {
+			return
+		}
+		err := cli.SendPresence(ctx, types.PresenceAvailable)
+		if err != nil {
+			log.Warnf("Failed to send available presence: %v", err)
+		}
+		printUserInfo()
 	case *events.StreamReplaced:
 		os.Exit(0)
 	case *events.Message:
