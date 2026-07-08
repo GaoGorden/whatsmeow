@@ -621,7 +621,7 @@ func handleCmd(cmd string, args []string) {
 			ExistingID:  existingID,
 		})
 		if err != nil {
-			log.Errorf("Failed to get avatar for %s: %v", jid, err)
+			//log.Errorf("Failed to get avatar for %s: %v", jid, err)
 			ProtoOutput(MsgGetAvatarFail, map[string]any{"jid": searchPhoneNum(ctx, jid)})
 		} else if pic != nil {
 			ProtoOutput(MsgGetAvatar, map[string]any{"jid": searchPhoneNum(ctx, jid), "url": pic.URL})
