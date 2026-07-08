@@ -1198,6 +1198,7 @@ func handler(rawEvt interface{}) {
 			log.Warnf("Failed to send available presence: %v", err)
 		}
 		printUserInfo()
+		parseRealLid()
 	case *events.StreamReplaced:
 		os.Exit(0)
 	case *events.Message:
