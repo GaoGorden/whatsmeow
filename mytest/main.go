@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -74,6 +75,7 @@ var enableViewOnce = false
 
 var device *store.Device
 var lid = ""
+var presenceMgr *PresenceManager
 
 func main() {
 
@@ -128,6 +130,7 @@ func main() {
 	}
 
 	cli = whatsmeow.NewClient(device, waLog.Stdout("Client", logLevel, true))
+	presenceMgr = NewPresenceManager(cli)
 	var isWaitingForPair atomic.Bool
 	cli.PrePairCallback = func(jid types.JID, platform, businessName string) bool {
 		isWaitingForPair.Store(true)
@@ -168,6 +171,22 @@ func main() {
 	//		}
 	//	}()
 	//}
+
+	// Heartbeat: report process health metrics every 60 seconds for Java-side zombie detection
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			ProtoOutput(MsgHeartbeat, map[string]any{
+				"goroutines":  runtime.NumGoroutine(),
+				"mem_mb":      m.Alloc / 1024 / 1024,
+				"subscribers": presenceMgr.Count(),
+				"uptime_sec":  time.Since(time.Unix(startupTime, 0)).Seconds(),
+			})
+		}
+	}()
 
 	cli.AddEventHandler(handler)
 	if device.ID != nil {
@@ -425,13 +444,8 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: subscribepresence <jid>")
 			return
 		}
-		jid, ok := parseJID(args[0])
-		if !ok {
-			return
-		}
-		err := cli.SubscribePresence(ctx, jid)
-		if err != nil {
-			fmt.Println(err)
+		if err := presenceMgr.Subscribe(args[0]); err != nil {
+			log.Errorf("Failed to subscribe presence for %s: %v", args[0], err)
 		}
 	case "presence":
 		if len(args) == 0 {
@@ -1187,6 +1201,8 @@ func handler(rawEvt interface{}) {
 		if err != nil {
 			log.Warnf("Failed to send available presence: %v", err)
 		}
+		// Re-subscribe all tracked contacts after reconnect (subscriptions are lost on disconnect)
+		go presenceMgr.ResubscribeAll()
 	case *events.PushNameSetting:
 		// Pushname changed mid-session: re-send presence to update server,
 		// notify Java of new nickname. Not a login event.
@@ -1200,7 +1216,21 @@ func handler(rawEvt interface{}) {
 		printUserInfo()
 		parseRealLid()
 	case *events.StreamReplaced:
-		os.Exit(0)
+		log.Warnf("Stream replaced (logged in elsewhere), notifying Java and exiting")
+		ProtoOutput(MsgStreamReplaced, map[string]any{
+			"reason": "logged_in_elsewhere",
+		})
+		cli.Disconnect()
+		time.Sleep(3 * time.Second) // Give Java time to process the proto message
+		os.Exit(42)
+	case *events.LoggedOut:
+		log.Warnf("Logged out event received (reason: %v), notifying Java and exiting", evt.Reason)
+		ProtoOutput(MsgLoggedOut, map[string]any{
+			"reason": evt.Reason.String(),
+		})
+		cli.Disconnect()
+		time.Sleep(3 * time.Second)
+		os.Exit(43)
 	case *events.Message:
 		metaParts := []string{fmt.Sprintf("pushname: %s", evt.Info.PushName), fmt.Sprintf("timestamp: %s", evt.Info.Timestamp)}
 		if evt.Info.Type != "" {
@@ -1285,13 +1315,15 @@ func handler(rawEvt interface{}) {
 					pushName = evt.Info.PushName
 				}
 				go func() {
-					data, err := cli.Download(ctx, img)
+					dlCtx, dlCancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer dlCancel()
+					data, err := cli.Download(dlCtx, img)
 					if err != nil {
-						log.Errorf("Failed to download view once image: %v", err)
+						log.Errorf("Failed to download view-once image: %v", err)
 						return
 					}
 					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *img.FileLength, 0); err != nil {
-						log.Errorf("Failed to upload view once image: %v", err)
+						log.Errorf("Failed to upload view-once image: %v", err)
 					}
 				}()
 			}
@@ -1304,13 +1336,15 @@ func handler(rawEvt interface{}) {
 					pushName = evt.Info.PushName
 				}
 				go func() {
-					data, err := cli.Download(ctx, video)
+					dlCtx, dlCancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer dlCancel()
+					data, err := cli.Download(dlCtx, video)
 					if err != nil {
-						log.Errorf("Failed to download view once video: %v", err)
+						log.Errorf("Failed to download view-once video: %v", err)
 						return
 					}
 					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *video.FileLength, *video.Seconds); err != nil {
-						log.Errorf("Failed to upload view once video: %v", err)
+						log.Errorf("Failed to upload view-once video: %v", err)
 					}
 				}()
 			}
@@ -1323,13 +1357,15 @@ func handler(rawEvt interface{}) {
 					pushName = evt.Info.PushName
 				}
 				go func() {
-					data, err := cli.Download(ctx, audio)
+					dlCtx, dlCancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer dlCancel()
+					data, err := cli.Download(dlCtx, audio)
 					if err != nil {
-						log.Errorf("Failed to download view once audio: %v", err)
+						log.Errorf("Failed to download view-once audio: %v", err)
 						return
 					}
 					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *audio.FileLength, *audio.Seconds); err != nil {
-						log.Errorf("Failed to upload view once audio: %v", err)
+						log.Errorf("Failed to upload view-once audio: %v", err)
 					}
 				}()
 			}
@@ -1440,7 +1476,8 @@ func searchJid(ctx context.Context, lid types.JID) types.JID {
 }
 
 func uploadAndNotify(observerId string, pushName string, fileName string, fileData []byte, fileLength uint64, seconds uint32) error {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	mType := mimetype.Detect(fileData)
 	miniType := mType.String()
 	objectKey := "whatsapp/view-once/" + cli.Store.GetJID().String() + "/" + fileName + mType.Extension()

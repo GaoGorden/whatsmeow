@@ -28,6 +28,12 @@ const (
 	MsgViewOnceFile     = "viewOnceFile"
 	MsgViewOnceEnabled  = "viewOnceEnabled"
 	MsgPairError        = "pairError"
+
+	// Stability monitoring messages
+	MsgHeartbeat      = "heartbeat"      // Periodic health report (goroutines, memory, subscribers)
+	MsgResubscribe    = "resubscribe"    // Result of auto-resubscribe after reconnect
+	MsgStreamReplaced = "streamReplaced" // Session taken over by another device
+	MsgLoggedOut      = "loggedOut"      // Logged out event from WhatsApp server
 )
 
 // ProtoOutput writes a structured JSON protocol message to stdout.

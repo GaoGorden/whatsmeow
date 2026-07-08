@@ -16,11 +16,13 @@
 
 ### mytest/ — 单客户端版（当前生产使用）
 
-由 Java Server 的 `ProcessUtils` 启动和管理，通过 **stdout 输出** 与 Java Server 通信。
+由 Java Server 的 `ProcessUtils` 启动和管理，通过 **`##PROTO##` JSON 协议**（stdout）与 Java Server 通信。
 
 | 文件 | 说明 |
 |------|------|
 | `main.go` | 【核心】生产入口，包含完整的事件处理和命令系统 |
+| `proto_output.go` | Proto 协议输出封装（`ProtoOutput()` 函数 + `Msg*` 消息类型常量） |
+| `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅） |
 | `main_new.go` | 原始上游示例代码（函数名改为 `maingg()`，不执行） |
 | `go.mod` | 独立 Go module，通过 `replace` 指向本地 whatsmeow 库 |
 | `amazon.yaml` | AWS S3 凭证配置（`//go:embed` 嵌入） |
@@ -228,26 +230,57 @@ whatsmeow/
 
 ### Java → Go（stdin 命令）
 
-Java Server 通过 `Process.getOutputStream()` 向 Go 进程写入命令字符串：
+Java Server 通过 `Process.getOutputStream()` 向 Go 进程写入命令字符串（每行一条命令 + `\n`）：
 - 登录命令、订阅命令、ViewOnce 开关等
+- 每个用户的命令通过 Java 端 per-user 锁保证不交叉
 
-### Go → Java（stdout 输出）
+### Go → Java（stdout 输出 — Proto 协议）
 
-Go 进程通过 `fmt.Printf` / `log.Infof` 输出结构化信息，Java Server 的 `ProcessLineUtils` 逐行解析：
+Go 进程通过 `ProtoOutput()` 函数输出 **`##PROTO##` 前缀的 JSON 消息**，Java Server 的 `ProcessUtils` 解析 `ProtoMessage`。
 
-**关键输出格式**：
+**输出格式**：`##PROTO##{"type":"<消息类型>","field1":"value1",...}`
+
+**消息类型常量**（定义在 `proto_output.go`）：
+
+| 常量 | type 值 | 说明 |
+|------|--------|------|
+| `MsgPresence` | `presence` | 联系人在线/离线状态 |
+| `MsgReadReceipt` | `readReceipt` | 消息已读回执 |
+| `MsgReceivedMessage` | `receivedMessage` | 收到消息通知 |
+| `MsgCheckUser` | `checkUser` | 号码检查结果 |
+| `MsgGetAvatar` | `getAvatar` | 头像获取成功 |
+| `MsgGetAvatarFail` | `getAvatarFail` | 头像获取失败 |
+| `MsgLoginSuccess` | `loginSuccess` | 登录成功 |
+| `MsgPushName` | `pushName` | 用户昵称 |
+| `MsgPhoneNumber` | `phoneNumber` | 用户手机号 |
+| `MsgQrCode` | `qrCode` | QR 码数据 |
+| `MsgLinkingCode` | `linkingCode` | 配对码 |
+| `MsgQrTimeout` | `qrTimeout` | QR 码超时 |
+| `MsgLogoutSuccess` | `logoutSuccess` | 登出确认 |
+| `MsgViewOnceFile` | `viewOnceFile` | 阅后即焚文件通知 |
+| `MsgViewOnceEnabled` | `viewOnceEnabled` | ViewOnce 开关确认 |
+| `MsgPairError` | `pairError` | 配对错误 |
+| `MsgHeartbeat` | `heartbeat` | 进程心跳（60s 间隔） |
+| `MsgResubscribe` | `resubscribe` | 重连后重订阅结果 |
+| `MsgStreamReplaced` | `streamReplaced` | 被顶号（其他设备登录） |
+| `MsgLoggedOut` | `loggedOut` | 服务端登出 |
+
+**稳定性机制**：
+- **PresenceManager**（`presence_manager.go`）：跟踪所有已订阅的联系人 JID，`events.Connected` 时自动调用 `ResubscribeAll()` 重订阅
+- **心跳**：每 60 秒输出 `heartbeat`，上报 goroutine 数、内存使用、订阅数、运行时间
+- **StreamReplaced 处理**：发送 Proto 通知 → `cli.Disconnect()` → `time.Sleep(3s)` → `os.Exit(42)`
+- **LoggedOut 处理**：发送 Proto 通知 → `cli.Disconnect()` → `time.Sleep(3s)` → `os.Exit(43)`
+- **ViewOnce 超时保护**：下载 60 秒超时，上传 30 秒超时（`context.WithTimeout`）
+
+### Go → Java（库级别日志 — 辅助）
+
+whatsmeow 库自身的 `log.Errorf` / `log.Warnf` 输出仍为纯文本行，Java 通过 `line.contains()` / 正则匹配作为回退：
 ```
-online: 1234567890@s.whatsapp.net          ← 联系人上线
-offline: 1234567890@s.whatsapp.net         ← 联系人离线
-offline: 1234567890@s.whatsapp.net 2024/01/01 12:00  ← 离线+最后在线时间
-view-once-file: {"observerId":"...","pushName":"...","miniType":"...","objectKey":"..."}  ← ViewOnce 文件上传完成
-push name is: John                         ← 登录用户昵称
-phone number is: 1234567890                ← 登录用户手机号
-real lid is: xxxxx@lid                     ← 自身 LID
-QR code: 2@...                             ← QR 码数据
-Linking code: XXXX-XXXX                    ← 验证码
-Got avatar success xxx: https://...AVATAREND  ← 头像 URL（以 AVATAREND 为结束标记）
+[Client/Socket ERROR] reconnecting in background    ← 库自动重连
+[Main ERROR] Failed to get avatar for ...           ← handleCmd 命令失败
 ```
+
+**注意**：`[Main ERROR]` 来自 `handleCmd()` 的命令执行失败（如 getavatar 目标没有头像），Java 端将其视为命令级错误（不触发重启），仅 `[Client*/Database*]` 错误进入重启频率窗口。
 
 ## 配置与依赖
 
@@ -278,7 +311,7 @@ Got avatar success xxx: https://...AVATAREND  ← 头像 URL（以 AVATAREND 为
 2. **SQLite 锁定**：每个 Go 进程使用独立的 `mdtest.db`，不存在并发锁问题
 3. **LID 解析**：WhatsApp 正在从电话号码迁移到 LID，所有事件中的 sender 可能返回 LID 而非真实号码，必须通过 `searchPhoneNum()` 转换
 4. **ViewOnce 下载**：异步进行（`go func()`），不阻塞主事件循环；上传到 S3 后才输出通知
-5. **stdout 通信**：Java Server 依赖 Go 进程的 stdout 输出格式，修改输出格式时需同步修改 `ProcessLineUtils` 和 `TerminalConstants`
+5. **Proto 协议同步**：修改 `##PROTO##` 消息格式或新增消息类型时，需同步修改 Go 的 `proto_output.go`（常量定义）和 Java 的 `TerminalConstants.java`（常量）+ `ProcessUtils.java`（处理逻辑）
 6. **上游同步**：Fork 版本需定期与 `tulir/whatsmeow` 同步协议更新，注意解决合并冲突
 7. **`mytest2` 是实验性**：多客户端 HTTP 版本尚在开发中，当前生产环境使用 `mytest`（单客户端 + Java Server 管理）
 8. **argo 目录**：包含自定义的 Argo 协议查询定义，嵌入了 `.argo` 和 `.json` 文件
