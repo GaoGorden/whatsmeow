@@ -315,5 +315,6 @@ whatsmeow 库自身的 `log.Errorf` / `log.Warnf` 输出仍为纯文本行，Jav
 6. **上游同步**：Fork 版本需定期与 `tulir/whatsmeow` 同步协议更新，注意解决合并冲突
 7. **`mytest2` 是实验性**：多客户端 HTTP 版本尚在开发中，当前生产环境使用 `mytest`（单客户端 + Java Server 管理）
 8. **argo 目录**：包含自定义的 Argo 协议查询定义，嵌入了 `.argo` 和 `.json` 文件
+9. **跨仓库联动**：修改 Proto 消息格式或 Go↔Java 通信协议后，检查 `watracker-server/CLAUDE.md` 是否需要同步更新（根目录 CLAUDE.md 的「文档同步」规则）
 9. **history JSON 文件**：根目录有大量 `history-*.json` 文件，是 HistorySync 事件的调试输出，生产环境可忽略或清理
 10. **`amazon.yaml` 包含 S3 密钥**：注意不要泄露
