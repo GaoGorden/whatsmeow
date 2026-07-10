@@ -285,6 +285,25 @@ func parseJID(arg string) (types.JID, bool) {
 func handleCmd(cmd string, args []string) {
 	ctx := context.Background()
 	switch cmd {
+	// Set device display name shown in WhatsApp "Linked Devices" list.
+	// Must be sent before pair-phone / require-qrcode for new registrations;
+	// already-paired devices retain their name server-side and are unaffected.
+	case "set-logintype":
+		if len(args) < 1 {
+			log.Errorf("Usage: set-logintype <waTracker_android|wastgo_win>")
+			return
+		}
+		switch args[0] {
+		case "waTracker_android":
+			store.DeviceProps.Os = proto.String("WeSeen")
+		case "wastgo_win":
+			store.DeviceProps.Os = proto.String("WastGo")
+		default:
+			log.Errorf("Unknown login type: %s", args[0])
+			return
+		}
+		log.Infof("Device display name set to: %s", *store.DeviceProps.Os)
+
 	case "enable-view-once":
 		enableViewOnce = true
 		ProtoOutput(MsgViewOnceEnabled, map[string]any{"enabled": true})
