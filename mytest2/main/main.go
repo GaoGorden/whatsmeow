@@ -99,6 +99,24 @@ var waitGroup sync.WaitGroup
 // --- 主要逻辑函数 ---
 
 func main() {
+	// 启动时打印协议版本与设备指纹，便于排查风控问题
+	waVer := store.GetWAVersion()
+	mainLog.Infof("=== Startup Info ===")
+	mainLog.Infof("whatsmeow WA version: %s (buildHash: %x)", waVer.String(), waVer.Hash())
+	mainLog.Infof("DeviceProps: OS=%q Version=%d.%d.%d PlatformType=%v",
+		store.DeviceProps.GetOs(),
+		store.DeviceProps.Version.GetPrimary(),
+		store.DeviceProps.Version.GetSecondary(),
+		store.DeviceProps.Version.GetTertiary(),
+		store.DeviceProps.GetPlatformType())
+	mainLog.Infof("BaseClientPayload: Platform=%v OsVersion=%q Manufacturer=%q Device=%q DeviceType=%v",
+		store.BaseClientPayload.UserAgent.GetPlatform(),
+		store.BaseClientPayload.UserAgent.GetOsVersion(),
+		store.BaseClientPayload.UserAgent.GetManufacturer(),
+		store.BaseClientPayload.UserAgent.GetDevice(),
+		store.BaseClientPayload.UserAgent.GetDeviceType())
+	mainLog.Infof("====================")
+
 	// 1. 读取配置文件
 	dir, err := os.Getwd()
 	mainLog.Infof("Current dir: %s", dir)
@@ -579,6 +597,8 @@ func runClientInstance(ctx context.Context, config ClientConfig, cancel context.
 	// 5.1 发送链接码
 	loginPhone := config.LoginPhone
 	if len(loginPhone) == 0 {
+		// PairPhone 必须使用浏览器类型（code pairing 是 WhatsApp 浏览器端功能）
+		// 服务器校验 companion_platform_display 必须为 "Browser (OS)" 格式，否则返回 400
 		linkingCode, err := cli.PairPhone(ctx, config.LoginPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if err != nil {
 			panic(err)

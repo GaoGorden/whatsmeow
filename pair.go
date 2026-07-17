@@ -98,6 +98,9 @@ func (cli *Client) getQRClientType() PairClientType {
 		return PairClientSafari
 	case waCompanionReg.DeviceProps_UWP:
 		return PairClientUWP
+	case waCompanionReg.DeviceProps_IOS_PHONE:
+		// 方案 C：配对阶段用浏览器身份（Chrome），注册阶段用 IOS_PHONE（保留 view-once）
+		return PairClientChrome
 	case waCompanionReg.DeviceProps_ANDROID_PHONE:
 		return PairClientAndroid
 	}

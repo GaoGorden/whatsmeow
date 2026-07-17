@@ -26,7 +26,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	_ "github.com/mattn/go-sqlite3"
-	//"github.com/mdp/qrterminal/v3"
+	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -115,6 +115,24 @@ func main() {
 		}
 	}
 	log = waLog.Stdout("Main", logLevel, true)
+
+	// 启动时打印协议版本与设备指纹，便于排查风控问题
+	waVer := store.GetWAVersion()
+	log.Infof("=== Startup Info ===")
+	log.Infof("whatsmeow WA version: %s (buildHash: %x)", waVer.String(), waVer.Hash())
+	log.Infof("DeviceProps: OS=%q Version=%d.%d.%d PlatformType=%v",
+		store.DeviceProps.GetOs(),
+		store.DeviceProps.Version.GetPrimary(),
+		store.DeviceProps.Version.GetSecondary(),
+		store.DeviceProps.Version.GetTertiary(),
+		store.DeviceProps.GetPlatformType())
+	log.Infof("BaseClientPayload: Platform=%v OsVersion=%q Manufacturer=%q Device=%q DeviceType=%v",
+		store.BaseClientPayload.UserAgent.GetPlatform(),
+		store.BaseClientPayload.UserAgent.GetOsVersion(),
+		store.BaseClientPayload.UserAgent.GetManufacturer(),
+		store.BaseClientPayload.UserAgent.GetDevice(),
+		store.BaseClientPayload.UserAgent.GetDeviceType())
+	log.Infof("====================")
 
 	dbLog := waLog.Stdout("Database", logLevel, true)
 	ctx := context.Background()
@@ -324,6 +342,9 @@ func handleCmd(cmd string, args []string) {
 			log.Infof("Client is ready")
 			//time.Sleep(2 * time.Second)
 		}
+		// PairPhone 必须使用浏览器类型（code pairing 是 WhatsApp 浏览器端功能）
+		// 服务器校验 companion_platform_display 必须为 "Browser (OS)" 格式，否则返回 400
+		// 注意：这里的浏览器身份 ≠ DeviceProps.PlatformType（后者控制 view-once 等设备能力，独立于配对阶段）
 		linkingCode, err := cli.PairPhone(ctx, args[0], true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if err != nil {
 			ProtoOutput(MsgPairError, map[string]any{"error": err.Error()})
@@ -344,6 +365,7 @@ func handleCmd(cmd string, args []string) {
 			for evt := range qrChan {
 				if evt.Event == whatsmeow.QRChannelEventCode {
 					ProtoOutput(MsgQrCode, map[string]any{"code": evt.Code})
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 				} else {
 					log.Infof("QR channel result: %s", evt.Event)
 					if evt.Event == whatsmeow.QRChannelTimeout.Event {

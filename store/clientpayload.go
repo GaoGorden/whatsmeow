@@ -101,32 +101,31 @@ func SetWAVersion(version WAVersionContainer) {
 
 var BaseClientPayload = &waWa6.ClientPayload{
 	UserAgent: &waWa6.ClientPayload_UserAgent{
-		//Platform: waWa6.ClientPayload_UserAgent_MACOS.Enum(),
+		// 设备指纹必须自洽：Platform=IOS + DeviceProps.PlatformType=IOS_PHONE（view-once 必须）
+		// 其余字段也要匹配一个完整的 iOS 设备画像，避免风控触发"可能是诈骗"提示
 		Platform:       waWa6.ClientPayload_UserAgent_IOS.Enum(),
 		ReleaseChannel: waWa6.ClientPayload_UserAgent_RELEASE.Enum(),
 		AppVersion:     waVersion.ProtoAppVersion(),
 		Mcc:            proto.String("000"),
 		Mnc:            proto.String("000"),
-		OsVersion:      proto.String("0.1"),
-		Manufacturer:   proto.String(""),
-		Device:         proto.String("Desktop"),
-		OsBuildNumber:  proto.String("0.1"),
+		OsVersion:      proto.String("18.2"),
+		Manufacturer:   proto.String("Apple"),
+		Device:         proto.String("iPhone"),
+		OsBuildNumber:  proto.String("22C161"),
+		DeviceType:     waWa6.ClientPayload_UserAgent_PHONE.Enum(),
 
 		LocaleLanguageIso6391:       proto.String("en"),
 		LocaleCountryIso31661Alpha2: proto.String("US"),
-	},
-	WebInfo: &waWa6.ClientPayload_WebInfo{
-		WebSubPlatform: waWa6.ClientPayload_WebInfo_WEB_BROWSER.Enum(),
 	},
 	ConnectType:   waWa6.ClientPayload_WIFI_UNKNOWN.Enum(),
 	ConnectReason: waWa6.ClientPayload_USER_ACTIVATED.Enum(),
 }
 
 var DeviceProps = &waCompanionReg.DeviceProps{
-	Os: proto.String(""),
+	Os: proto.String("iOS"),
 	Version: &waCompanionReg.DeviceProps_AppVersion{
-		Primary:   proto.Uint32(0),
-		Secondary: proto.Uint32(1),
+		Primary:   proto.Uint32(18),
+		Secondary: proto.Uint32(2),
 		Tertiary:  proto.Uint32(0),
 	},
 	HistorySyncConfig: &waCompanionReg.DeviceProps_HistorySyncConfig{
