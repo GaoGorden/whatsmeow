@@ -9,6 +9,7 @@
 - **上游**：`go.mau.fi/whatsmeow`（fork 自 tulir/whatsmeow）
 - **数据库**：SQLite（每个用户一个 `mdtest.db`，通过 sqlstore 管理）
 - **构建**：`cd mytest && go build`（单客户端）或 `cd mytest2/main && go build`（多客户端 HTTP 版）
+- **Go SDK 路径**：`D:\developmentKit\gosdk`
 - **部署**：`scp-linux-go-file.ps1` 上传编译好的 Linux 可执行文件到 Server
 - **CGO**：需要（`import "C"`，编译时依赖 C 库）
 
@@ -51,6 +52,25 @@
 | `/subscribeObservers` | POST | 订阅观察者 Last Seen |
 
 ## 核心定制功能
+
+### 0. iOS 设备指纹配置（运行时）
+
+**位置**：`store/deviceconfig.go`
+
+**功能**：通过 `SetDeviceFingerprintIOS()` 函数在运行时将设备指纹从默认的 WEB 切换为 iOS，以支持 ViewOnce 消息拦截。
+
+**调用时机**：`mytest/main.go` 在创建 `whatsmeow.Client` 之前调用：
+```go
+store.SetDeviceFingerprintIOS()
+cli = whatsmeow.NewClient(device, log)
+```
+
+**修改内容**：
+- `BaseClientPayload.UserAgent`: Platform=IOS, Manufacturer=Apple, Device=iPhone, OsVersion=18.2
+- `BaseClientPayload.WebInfo`: 设为 nil（iOS 不需要 WebInfo）
+- `DeviceProps`: Os=iOS, PlatformType=IOS_PHONE, Version=18.2.0
+
+**设计优势**：将设备指纹配置从库代码（`clientpayload.go`）提取到运行时配置，使得 `clientpayload.go` 与上游完全一致，大幅减少同步冲突。
 
 ### 1. ViewOnce 阅后即焚拦截
 
@@ -305,6 +325,59 @@ whatsmeow 库自身的 `log.Errorf` / `log.Warnf` 输出仍为纯文本行，Jav
 | `github.com/beeper/argo-go` | Argo 查询协议 |
 | `golang.org/x/crypto` | 加密工具 |
 
+## 上游同步
+
+### 同步脚本
+
+使用 `sync-upstream.sh` 自动化合并上游更新：
+
+```bash
+cd whatsmeow
+./sync-upstream.sh
+```
+
+脚本会自动：
+1. 拉取上游最新代码
+2. 创建同步分支
+3. 合并主分支的定制代码
+4. 验证编译
+5. 合并回主分支
+
+### 冲突处理
+
+如果合并时出现冲突，脚本会提示手动处理。当前核心库的定制代码集中在 3 个文件：
+
+| 文件 | 改动内容 | 处理方式 |
+|------|---------|---------|
+| `client.go` | `OnLoginSuccess` 回调、日志改进、passkey 字段简化 | 接受上游改动，手动加回 `OnLoginSuccess` 回调 |
+| `connectionevents.go` | `OnLoginSuccess` 回调调用、日志改进 | 接受上游改动，手动加回回调调用 |
+| `pair.go` | `IOS_PHONE → PairClientChrome` 映射 | 接受上游改动，手动加回 case |
+
+以下文件与上游完全一致，无需处理：
+- `store/clientpayload.go` ✓（iOS 设备指纹通过 `SetDeviceFingerprintIOS()` 在运行时配置）
+- `types/events/events.go` ✓
+
+### 手动同步（不使用脚本）
+
+如果需要手动同步：
+
+```bash
+# 1. 拉取上游
+git fetch upstream
+
+# 2. 合并
+git checkout main
+git merge upstream/main --no-commit
+
+# 3. 解决冲突（如有）
+
+# 4. 验证编译
+GOROOT=D:\developmentKit\gosdk\go1.26.2 go build ./...
+
+# 5. 提交
+git commit -m "sync: merge upstream changes"
+```
+
 ## 注意事项
 
 1. **CGO 依赖**：编译时必须启用 CGO（`CGO_ENABLED=1`），需要对应平台的 C 编译器
@@ -313,8 +386,9 @@ whatsmeow 库自身的 `log.Errorf` / `log.Warnf` 输出仍为纯文本行，Jav
 4. **ViewOnce 下载**：异步进行（`go func()`），不阻塞主事件循环；上传到 S3 后才输出通知
 5. **Proto 协议同步**：修改 `##PROTO##` 消息格式或新增消息类型时，需同步修改 Go 的 `proto_output.go`（常量定义）和 Java 的 `TerminalConstants.java`（常量）+ `ProcessUtils.java`（处理逻辑）
 6. **上游同步**：Fork 版本需定期与 `tulir/whatsmeow` 同步协议更新，注意解决合并冲突
-7. **`mytest2` 是实验性**：多客户端 HTTP 版本尚在开发中，当前生产环境使用 `mytest`（单客户端 + Java Server 管理）
-8. **argo 目录**：包含自定义的 Argo 协议查询定义，嵌入了 `.argo` 和 `.json` 文件
-9. **跨仓库联动**：修改 Proto 消息格式或 Go↔Java 通信协议后，检查 `watracker-server/CLAUDE.md` 是否需要同步更新（根目录 CLAUDE.md 的「文档同步」规则）
-9. **history JSON 文件**：根目录有大量 `history-*.json` 文件，是 HistorySync 事件的调试输出，生产环境可忽略或清理
-10. **`amazon.yaml` 包含 S3 密钥**：注意不要泄露
+7. **同步脚本**：使用 `sync-upstream.sh` 自动化同步流程
+8. **`mytest2` 是实验性**：多客户端 HTTP 版本尚在开发中，当前生产环境使用 `mytest`（单客户端 + Java Server 管理）
+9. **argo 目录**：包含自定义的 Argo 协议查询定义，嵌入了 `.argo` 和 `.json` 文件
+10. **跨仓库联动**：修改 Proto 消息格式或 Go↔Java 通信协议后，检查 `watracker-server/CLAUDE.md` 是否需要同步更新（根目录 CLAUDE.md 的「文档同步」规则）
+11. **history JSON 文件**：根目录有大量 `history-*.json` 文件，是 HistorySync 事件的调试输出，生产环境可忽略或清理
+12. **`amazon.yaml` 包含 S3 密钥**：注意不要泄露

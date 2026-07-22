@@ -8,7 +8,6 @@ package whatsmeow
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -157,7 +156,10 @@ func (cli *Client) handleConnectFailure(ctx context.Context, node *waBinary.Node
 }
 
 func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node) {
-	printUserInfo(cli)
+	if !cli.paired.Load() {
+		cli.Log.Warnf("Received connect success without pairing, ignoring")
+		return
+	}
 	cli.Log.Infof("Successfully authenticated")
 	cli.LastSuccessfulConnect = time.Now()
 	cli.AutoReconnectErrors = 0
@@ -226,16 +228,4 @@ func (cli *Client) SetPassive(ctx context.Context, passive bool) error {
 		return err
 	}
 	return nil
-}
-
-func printUserInfo(cli *Client) {
-	pushName := cli.Store.PushName
-	if pushName == "" {
-		contact, err := cli.Store.Contacts.GetContact(context.TODO(), *cli.Store.ID)
-		if err == nil {
-			pushName = contact.PushName
-		}
-	}
-	fmt.Printf("push name is: %s\n", pushName)
-	fmt.Printf("phone number is: %s\n", cli.Store.ID.ToNonAD().User)
 }

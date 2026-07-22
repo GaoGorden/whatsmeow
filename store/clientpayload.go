@@ -76,7 +76,7 @@ func (vc WAVersionContainer) ProtoAppVersion() *waWa6.ClientPayload_UserAgent_Ap
 }
 
 // waVersion is the WhatsApp web client version
-var waVersion = WAVersionContainer{2, 3000, 1039406452}
+var waVersion = WAVersionContainer{2, 3000, 1043423438}
 
 // waVersionHash is the md5 hash of a dot-separated waVersion
 var waVersionHash = waVersion.Hash()
@@ -101,31 +101,31 @@ func SetWAVersion(version WAVersionContainer) {
 
 var BaseClientPayload = &waWa6.ClientPayload{
 	UserAgent: &waWa6.ClientPayload_UserAgent{
-		// 设备指纹必须自洽：Platform=IOS + DeviceProps.PlatformType=IOS_PHONE（view-once 必须）
-		// 其余字段也要匹配一个完整的 iOS 设备画像，避免风控触发"可能是诈骗"提示
-		Platform:       waWa6.ClientPayload_UserAgent_IOS.Enum(),
+		Platform:       waWa6.ClientPayload_UserAgent_WEB.Enum(),
 		ReleaseChannel: waWa6.ClientPayload_UserAgent_RELEASE.Enum(),
 		AppVersion:     waVersion.ProtoAppVersion(),
 		Mcc:            proto.String("000"),
 		Mnc:            proto.String("000"),
-		OsVersion:      proto.String("18.2"),
-		Manufacturer:   proto.String("Apple"),
-		Device:         proto.String("iPhone"),
-		OsBuildNumber:  proto.String("22C161"),
-		DeviceType:     waWa6.ClientPayload_UserAgent_PHONE.Enum(),
+		OsVersion:      proto.String("0.1"),
+		Manufacturer:   proto.String(""),
+		Device:         proto.String("Desktop"),
+		OsBuildNumber:  proto.String("0.1"),
 
 		LocaleLanguageIso6391:       proto.String("en"),
 		LocaleCountryIso31661Alpha2: proto.String("US"),
+	},
+	WebInfo: &waWa6.ClientPayload_WebInfo{
+		WebSubPlatform: waWa6.ClientPayload_WebInfo_WEB_BROWSER.Enum(),
 	},
 	ConnectType:   waWa6.ClientPayload_WIFI_UNKNOWN.Enum(),
 	ConnectReason: waWa6.ClientPayload_USER_ACTIVATED.Enum(),
 }
 
 var DeviceProps = &waCompanionReg.DeviceProps{
-	Os: proto.String("iOS"),
+	Os: proto.String("whatsmeow"),
 	Version: &waCompanionReg.DeviceProps_AppVersion{
-		Primary:   proto.Uint32(18),
-		Secondary: proto.Uint32(2),
+		Primary:   proto.Uint32(0),
+		Secondary: proto.Uint32(1),
 		Tertiary:  proto.Uint32(0),
 	},
 	HistorySyncConfig: &waCompanionReg.DeviceProps_HistorySyncConfig{
@@ -134,7 +134,7 @@ var DeviceProps = &waCompanionReg.DeviceProps{
 		StorageQuotaMb:                           proto.Uint32(10240),
 		InlineInitialPayloadInE2EeMsg:            proto.Bool(true),
 		RecentSyncDaysLimit:                      nil,
-		SupportCallLogHistory:                    proto.Bool(false),
+		SupportCallLogHistory:                    proto.Bool(true),
 		SupportBotUserAgentChatHistory:           proto.Bool(true),
 		SupportCagReactionsAndPolls:              proto.Bool(true),
 		SupportBizHostedMsg:                      proto.Bool(true),
@@ -152,8 +152,7 @@ var DeviceProps = &waCompanionReg.DeviceProps{
 		SupportManusHistory:                      proto.Bool(true),
 		SupportHatchHistory:                      proto.Bool(true),
 	},
-	PlatformType: waCompanionReg.DeviceProps_IOS_PHONE.Enum(),
-	//PlatformType:    waCompanionReg.DeviceProps_UNKNOWN.Enum(),
+	PlatformType:    waCompanionReg.DeviceProps_UNKNOWN.Enum(),
 	RequireFullSync: proto.Bool(false),
 }
 

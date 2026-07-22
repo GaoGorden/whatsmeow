@@ -16,6 +16,7 @@ import (
 	armadillo "go.mau.fi/whatsmeow/proto"
 	"go.mau.fi/whatsmeow/proto/instamadilloTransportPayload"
 	"go.mau.fi/whatsmeow/proto/waArmadilloApplication"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waConsumerApplication"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
@@ -46,6 +47,7 @@ type PairSuccess struct {
 	LID          types.JID
 	BusinessName string
 	Platform     string
+	Props        *waCompanionReg.ClientPairingProps
 }
 
 // PairError is emitted when a pair-success event is received from the server, but finishing the pairing locally fails.
@@ -54,6 +56,7 @@ type PairError struct {
 	LID          types.JID
 	BusinessName string
 	Platform     string
+	Props        *waCompanionReg.ClientPairingProps
 	Error        error
 }
 

@@ -147,6 +147,9 @@ func main() {
 		return
 	}
 
+	// Configure iOS device fingerprint for ViewOnce support
+	store.SetDeviceFingerprintIOS()
+
 	cli = whatsmeow.NewClient(device, waLog.Stdout("Client", logLevel, true))
 	presenceMgr = NewPresenceManager(cli)
 	var isWaitingForPair atomic.Bool
