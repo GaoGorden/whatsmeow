@@ -26,7 +26,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -368,7 +367,7 @@ func handleCmd(cmd string, args []string) {
 			for evt := range qrChan {
 				if evt.Event == whatsmeow.QRChannelEventCode {
 					ProtoOutput(MsgQrCode, map[string]any{"code": evt.Code})
-					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					printQRCode(evt.Code)
 				} else {
 					log.Infof("QR channel result: %s", evt.Event)
 					if evt.Event == whatsmeow.QRChannelTimeout.Event {
