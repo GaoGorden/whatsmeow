@@ -20,6 +20,20 @@ if ! git diff --quiet HEAD; then
     exit 1
 fi
 
+# 配置 Go 环境
+GOSDK_DIR="D:/developmentKit/gosdk"
+TOOLCHAIN_VER=$(grep "toolchain" go.mod | awk '{print $2}' 2>/dev/null || echo "go1.25.0")
+GOSDK_VER=$(ls "$GOSDK_DIR" 2>/dev/null | sort -V | grep -E "^go" | tail -1)
+
+if [ -z "$GOSDK_VER" ]; then
+    echo "⚠️ 未找到 Go SDK，尝试使用系统默认 Go"
+else
+    export GOROOT="$GOSDK_DIR/$GOSDK_VER"
+    export PATH="$GOROOT/bin:$PATH"
+    export GOTOOLCHAIN=local
+    echo "✓ 使用 Go SDK: $GOSDK_VER"
+fi
+
 echo "✓ 环境检查通过"
 echo ""
 
@@ -47,15 +61,15 @@ else
     echo ""
     echo "以下文件可能需要手动处理："
     echo ""
-    echo "1. client.go（37 行差异）"
+    echo "1. client.go"
     echo "   - 接受上游改动：git checkout --theirs client.go"
     echo "   - 然后手动添加 OnLoginSuccess 回调（在 PrePairCallback 之后）"
     echo ""
-    echo "2. connectionevents.go（9 行差异）"
+    echo "2. connectionevents.go"
     echo "   - 接受上游改动：git checkout --theirs connectionevents.go"
     echo "   - 然后手动添加 OnLoginSuccess() 调用（在 isLoggedIn.Store(true) 之后）"
     echo ""
-    echo "3. pair.go（3 行差异）"
+    echo "3. pair.go"
     echo "   - 接受上游改动：git checkout --theirs pair.go"
     echo "   - 然后在 getQRClientType() 的 switch 中添加 IOS_PHONE case"
     echo ""
@@ -77,6 +91,9 @@ if go build ./...; then
     echo "✓ 编译通过"
 else
     echo "❌ 编译失败，请检查代码"
+    echo "提示：可能需要手动指定 Go SDK 路径"
+    echo "  export GOROOT=D:/developmentKit/gosdk/go1.xx.x"
+    echo "  export GOTOOLCHAIN=local"
     exit 1
 fi
 
@@ -85,7 +102,7 @@ echo ""
 echo "步骤 5/5：合并回主分支..."
 git checkout main
 git merge "$SYNC_BRANCH" -m "sync: upstream merged"
-git branch -d "$SYNC_BRANCH"
+git branch -D "$SYNC_BRANCH"
 
 echo ""
 echo "=== 同步完成 ==="
