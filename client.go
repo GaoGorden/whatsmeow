@@ -169,6 +169,11 @@ type Client struct {
 	// the client will disconnect.
 	PrePairCallback func(jid types.JID, platform, businessName string) bool
 
+	// OnLoginSuccess is called synchronously in handleConnectSuccess after the WhatsApp server
+	// confirms authentication (isLoggedIn=true). This fires earlier than the Connected event
+	// (which waits for PreKey upload and SetPassive to complete).
+	OnLoginSuccess func()
+
 	// GetClientPayload is called to get the client payload for connecting to the server.
 	// This should NOT be used for WhatsApp (to change the OS name, update fields in store.BaseClientPayload directly).
 	GetClientPayload func() *waWa6.ClientPayload

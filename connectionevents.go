@@ -164,6 +164,9 @@ func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node
 	cli.LastSuccessfulConnect = time.Now()
 	cli.AutoReconnectErrors = 0
 	cli.isLoggedIn.Store(true)
+	if cli.OnLoginSuccess != nil {
+		cli.OnLoginSuccess()
+	}
 	ag := node.AttrGetter()
 	nodeLID := ag.JID("lid")
 	cli.serverTimeOffset.Store(int64(ag.UnixTime("t").Sub(time.Now().Round(time.Second))))
