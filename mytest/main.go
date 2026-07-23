@@ -456,6 +456,8 @@ func handleCmd(cmd string, args []string) {
 		if err != nil {
 			log.Errorf("Failed to check if users are on WhatsApp: %v", err)
 		} else {
+			// 记录已响应的号码（去掉 + 前缀），用于补发未返回的号码
+			respondedPhones := make(map[string]bool, len(resp))
 			for _, item := range resp {
 				data := map[string]any{
 					"query": item.Query,
@@ -466,6 +468,19 @@ func handleCmd(cmd string, args []string) {
 					data["businessName"] = item.VerifiedName.Details.GetVerifiedName()
 				}
 				ProtoOutput(MsgCheckUser, data)
+				respondedPhones[strings.TrimPrefix(item.Query, "+")] = true
+			}
+			// 对于 WhatsApp 服务器未返回的号码（未注册等情况），补发 isIn=false
+			for _, phone := range args {
+				cleanPhone := strings.TrimPrefix(phone, "+")
+				if !respondedPhones[cleanPhone] {
+					log.Infof("checkuser: phone %s not in response, emitting isIn=false", cleanPhone)
+					ProtoOutput(MsgCheckUser, map[string]any{
+						"query": cleanPhone,
+						"isIn":  false,
+						"jid":   cleanPhone + "@s.whatsapp.net",
+					})
+				}
 			}
 		}
 	//case "checkupdate":
