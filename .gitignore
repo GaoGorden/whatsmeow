@@ -3,4 +3,7 @@
 /mytest/amazon.yaml
 history-*.json
 
+# Go 构建产物（mytest.exe / mytest2 等）
+*.exe
+
 .claude
