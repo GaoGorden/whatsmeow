@@ -17,12 +17,16 @@
 
 ### mytest/ — 单客户端版（当前生产使用）
 
-由 Java Server 的 `ProcessUtils` 启动和管理，通过 **`##PROTO##` JSON 协议**（stdout）与 Java Server 通信。
+由 Java Server 的 `ProcessUtils` 启动和管理，与 Java Server 通信有两种模式：
+- **daemon 模式（Linux 生产）**：传 `--socket={path}` 参数进入。Go 进程 `syscall.Setsid()` 脱离 JVM 进程组成为 daemon，命令从 Unix domain socket 接收、`ProtoOutput` 事件写回 socket。配合 `wa-server.service` 的 `KillMode=process`，Java 重启时 Go 不被杀、可被重新 attach，WhatsApp 连接与 presence 订阅不中断。
+- **旧管道模式（Windows 本地联调）**：不传 `--socket`，命令从 stdin 读、事件写 stdout。
 
 | 文件 | 说明 |
 |------|------|
-| `main.go` | 【核心】生产入口，包含完整的事件处理和命令系统 |
-| `proto_output.go` | Proto 协议输出封装（`ProtoOutput()` 函数 + `Msg*` 消息类型常量） |
+| `main.go` | 【核心】生产入口，包含完整的事件处理、命令系统、daemon 化（`--socket` flag + `daemonize()` + `startCommandSocket`） |
+| `proto_output.go` | Proto 协议输出封装（`ProtoOutput()` + `Msg*` 常量 + `protoBackend` 抽象：stdout/socket 双 backend，socket 断开静默忽略） |
+| `daemon_linux.go` | Linux daemon 化（`syscall.Setsid()` + `signal.Ignore(SIGPIPE)`） |
+| `daemon_other.go` | 非 Linux daemon 化 no-op（Windows 联调用） |
 | `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅） |
 | `main_new.go` | 原始上游示例代码（函数名改为 `maingg()`，不执行） |
 | `go.mod` | 独立 Go module，通过 `replace` 指向本地 whatsmeow 库 |
@@ -153,9 +157,9 @@ WhatsApp 使用 LID（Linked ID）代替真实电话号码，需要反查：
 - 输出 `push name` 和 `phone number`（Java Server 解析为登录成功标记）
 - 解析自己的 LID
 
-### 5. 命令系统（stdin 交互）
+### 5. 命令系统（stdin / socket 交互）
 
-Java Server 通过 stdin 向 Go 进程发送命令：
+Java Server 向 Go 进程发送命令：daemon 模式写 Unix socket，旧模式写 stdin。命令集相同：
 
 | 命令 | 说明 |
 |------|------|

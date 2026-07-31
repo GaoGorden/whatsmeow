@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"regexp"
@@ -58,6 +59,15 @@ var debugLogs = flag.Bool("debug", false, "Enable debug logs?")
 var dbDialect = flag.String("db-dialect", "sqlite3", "Database dialect (sqlite3 or postgres)")
 var dbAddress = flag.String("db-address", "file:mdtest.db?_foreign_keys=on", "Database address")
 var requestFullSync = flag.Bool("request-full-sync", false, "Request full (1 year) history sync when logging in?")
+
+// socketPath: Unix domain socket 路径，由 Java Server 通过命令行参数传入。
+// 传了该参数则 Go 进程进入 daemon 模式：命令从 socket 接收、ProtoOutput 事件写回 socket，
+// 不再依赖 stdin/stdout 管道（Java 重启时 Go 不受影响、可被重新 attach）。留空则回退到旧的
+// stdin/stdout 管道模式（Windows 本地联调用）。
+var socketPath = flag.String("socket", "", "Unix domain socket path for Java IPC (daemon mode). Empty = legacy stdin/stdout mode.")
+
+// daemonMode: 是否处于 daemon 模式（socketPath 非空）。启动早期根据 flag 设置。
+var daemonMode = false
 var pairRejectChan = make(chan bool, 1)
 
 type Amazon struct {
@@ -100,7 +110,18 @@ func main() {
 	s3Client = s3.NewFromConfig(cfg)
 
 	waBinary.IndentXML = true
-	//flag.Parse()
+	flag.Parse()
+
+	// daemon 模式判定：传了 --socket 即进入 daemon 模式
+	daemonMode = *socketPath != ""
+	if daemonMode {
+		// daemon 化（Linux: setsid 脱离 JVM 进程组 + 忽略 SIGPIPE；非 Linux: no-op）
+		// 配合 systemd KillMode=process 让 Go 在 Java 重启时存活
+		daemonize()
+		// ProtoOutput 事件从 stdout 改写 Unix socket（Java 重启时 stdout pipe 会断，必须迁通道）
+		setDaemonBackend()
+		// socket 监听在下方 input channel 声明后启动（startCommandSocket 需要喂入 input）
+	}
 
 	if *debugLogs {
 		logLevel = "DEBUG"
@@ -222,28 +243,42 @@ func main() {
 
 	c := make(chan os.Signal, 1)
 	input := make(chan string)
+	// daemon 模式下命令由 startCommandSocket 启动的 accept goroutine 喂入 input channel；
+	// 旧模式下由下方 stdin goroutine 喂入。signal 两个模式都注册。
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		defer close(input)
-		scan := bufio.NewScanner(os.Stdin)
-		for scan.Scan() {
-			line := strings.TrimSpace(scan.Text())
-			if len(line) > 0 {
-				input <- line
+
+	if daemonMode {
+		// daemon 模式：从 Unix socket 接收 Java 命令，事件也通过 socket 回写
+		startCommandSocket(input, *socketPath)
+	} else {
+		// 旧模式（Windows 本地联调 / 未传 --socket）：从 stdin 读命令
+		go func() {
+			defer close(input)
+			scan := bufio.NewScanner(os.Stdin)
+			for scan.Scan() {
+				line := strings.TrimSpace(scan.Text())
+				if len(line) > 0 {
+					input <- line
+				}
 			}
-		}
-	}()
+		}()
+	}
 	for {
 		select {
 		case <-c:
 			log.Infof("Interrupt received, exiting")
 			cli.Disconnect()
 			return
-		case cmd := <-input:
-			if len(cmd) == 0 {
-				log.Infof("Stdin closed, exiting")
-				cli.Disconnect()
-				return
+		case cmd, ok := <-input:
+			// daemon 模式下 input channel 不会关闭（socket accept 循环常驻）；
+			// 旧模式下 stdin goroutine defer close(input) 会导致 ok=false → 退出
+			if !ok || len(cmd) == 0 {
+				if !daemonMode {
+					log.Infof("Stdin closed, exiting")
+					cli.Disconnect()
+					return
+				}
+				continue
 			}
 			if isWaitingForPair.Load() {
 				if cmd == "r" {
@@ -259,6 +294,53 @@ func main() {
 			go handleCmd(strings.ToLower(cmd), args)
 		}
 	}
+}
+
+// startCommandSocket listens on a Unix domain socket for Java commands and feeds them
+// into the shared input channel (same as the legacy stdin goroutine). Also installs the
+// accepted connection as the ProtoOutput backend so Go→Java events flow back over the
+// same socket. A single Java client is expected at a time; a new connection replaces the
+// old one (Java re-attach after restart). A client disconnecting does NOT exit the daemon.
+func startCommandSocket(input chan<- string, sockPath string) {
+	// 清理可能残留的旧 socket 文件（上次异常退出留下）
+	_ = os.Remove(sockPath)
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		log.Errorf("Failed to listen on socket %s: %v", sockPath, err)
+		return
+	}
+	// 限制权限：仅属主读写
+	_ = os.Chmod(sockPath, 0600)
+	log.Infof("Command socket listening at %s", sockPath)
+
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				// listener closed (daemon exiting)
+				return
+			}
+			// 新 Java 连接到来：设为 ProtoOutput 后端，旧连接会被 setProtoConn 关闭
+			setProtoConn(conn)
+			log.Infof("Java client connected from %s", conn.RemoteAddr())
+			go func(c net.Conn) {
+				defer func() {
+					clearProtoConn()
+					_ = c.Close()
+				}()
+				scan := bufio.NewScanner(c)
+				scan.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+				for scan.Scan() {
+					line := strings.TrimSpace(scan.Text())
+					if len(line) > 0 {
+						input <- line
+					}
+				}
+				// client disconnected (Java restart) — daemon stays alive, waits for re-attach
+				log.Infof("Java client disconnected, daemon stays alive")
+			}(conn)
+		}
+	}()
 }
 
 func parseRealLid() {
