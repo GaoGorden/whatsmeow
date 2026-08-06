@@ -17,14 +17,14 @@
 
 ### mytest/ — 单客户端版（当前生产使用）
 
-由 Java Server 的 `ProcessUtils` 启动和管理，与 Java Server 通信有两种模式：
+由 Java Server 的 `ProcessUtils` 启动和管理，与 Java Server 通信统一走 **Unix domain socket**（Windows 测试与 Linux 生产一致）：
 - **daemon 模式（Linux 生产）**：传 `--socket={path}` 参数进入。Go 进程 `syscall.Setsid()` 脱离 JVM 进程组成为 daemon，命令从 Unix domain socket 接收、`ProtoOutput` 事件写回 socket。配合 `wa-server.service` 的 `KillMode=process`，Java 重启时 Go 不被杀、可被重新 attach，WhatsApp 连接与 presence 订阅不中断。
-- **旧管道模式（Windows 本地联调）**：不传 `--socket`，命令从 stdin 读、事件写 stdout。
+- **daemon 模式（Windows 本地联调）**：同样传 `--socket={path}`（`run_windows.bat` 用 `%*` 透传）。`daemonize()` 在非 Linux 为 no-op（无 Setsid），但 Windows 父进程退出后子进程存活，Java 重启时 Go daemon 同样存活、可被重新 attach，验证链路与生产一致。
 
 | 文件 | 说明 |
 |------|------|
 | `main.go` | 【核心】生产入口，包含完整的事件处理、命令系统、daemon 化（`--socket` flag + `daemonize()` + `startCommandSocket`） |
-| `proto_output.go` | Proto 协议输出封装（`ProtoOutput()` + `Msg*` 常量 + `protoBackend` 抽象：stdout/socket 双 backend，socket 断开静默忽略） |
+| `proto_output.go` | Proto 协议输出封装（`ProtoOutput()` + `Msg*` 常量 + `protoBackend` 抽象：stdout/socket 双 backend，socket 断开静默忽略。⚠️ 连接字段用普通 `net.Conn` + mutex，**不能用 `atomic.Value`**——Go 禁止 Store/Swap nil 进 Value，`clearProtoConn()` 的 `Swap(nil)` 会导致 Java 断开连接时 panic、进程以退出码 2 崩溃，详见 `doc/Go进程daemon模式panic崩溃修复.md`） |
 | `daemon_linux.go` | Linux daemon 化（`syscall.Setsid()` + `signal.Ignore(SIGPIPE)`） |
 | `daemon_other.go` | 非 Linux daemon 化 no-op（Windows 联调用） |
 | `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅） |
@@ -85,7 +85,7 @@ cli = whatsmeow.NewClient(device, log)
 2. 通过 `searchPhoneNum()` 将 LID 解析为真实电话号码
 3. 通过 `getNickName()` 获取联系人昵称（优先 FullName → PushName）
 4. 异步调用 `cli.Download()` 下载媒体
-5. `uploadAndNotify()` 上传到 S3 并输出 JSON 通知（Java Server 通过 stdout 解析）
+5. `uploadAndNotify()` 上传到 S3 并输出 JSON 通知（`ProtoOutput(MsgViewOnceFile)`，Java Server 通过 socket/Proto 协议解析）
 
 **S3 上传路径**：`whatsapp/view-once/{userJID}/{messageID}{extension}`
 
@@ -157,9 +157,9 @@ WhatsApp 使用 LID（Linked ID）代替真实电话号码，需要反查：
 - 输出 `push name` 和 `phone number`（Java Server 解析为登录成功标记）
 - 解析自己的 LID
 
-### 5. 命令系统（stdin / socket 交互）
+### 5. 命令系统（socket 交互）
 
-Java Server 向 Go 进程发送命令：daemon 模式写 Unix socket，旧模式写 stdin。命令集相同：
+Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一致）。命令集：
 
 | 命令 | 说明 |
 |------|------|
@@ -252,15 +252,15 @@ whatsmeow/
 
 ## 与 Java Server 的通信协议
 
-### Java → Go（stdin 命令）
+### Java → Go（Unix socket 命令）
 
-Java Server 通过 `Process.getOutputStream()` 向 Go 进程写入命令字符串（每行一条命令 + `\n`）：
+Java Server 通过 Unix socket 向 Go 进程写入命令字符串（每行一条命令 + `\n`）：
 - 登录命令、订阅命令、ViewOnce 开关等
 - 每个用户的命令通过 Java 端 per-user 锁保证不交叉
 
-### Go → Java（stdout 输出 — Proto 协议）
+### Go → Java（Unix socket 输出 — Proto 协议）
 
-Go 进程通过 `ProtoOutput()` 函数输出 **`##PROTO##` 前缀的 JSON 消息**，Java Server 的 `ProcessUtils` 解析 `ProtoMessage`。
+Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 JSON 消息**，Java Server 的 `ProcessUtils` 解析 `ProtoMessage`（socket 断开时静默忽略，Java 重连后继续输出）。
 
 **输出格式**：`##PROTO##{"type":"<消息类型>","field1":"value1",...}`
 

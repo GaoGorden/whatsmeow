@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
 )
 
 // PROTO_PREFIX is the unique prefix that separates protocol messages from log output.
@@ -15,22 +14,22 @@ const PROTO_PREFIX = "##PROTO##"
 
 // Protocol message type constants
 const (
-	MsgPresence         = "presence"
-	MsgReadReceipt      = "readReceipt"
-	MsgReceivedMessage  = "receivedMessage"
-	MsgCheckUser        = "checkUser"
-	MsgGetAvatar        = "getAvatar"
-	MsgGetAvatarFail    = "getAvatarFail"
-	MsgLoginSuccess     = "loginSuccess"
-	MsgPushName         = "pushName"
-	MsgPhoneNumber      = "phoneNumber"
-	MsgQrCode           = "qrCode"
-	MsgLinkingCode      = "linkingCode"
-	MsgQrTimeout        = "qrTimeout"
-	MsgLogoutSuccess    = "logoutSuccess"
-	MsgViewOnceFile     = "viewOnceFile"
-	MsgViewOnceEnabled  = "viewOnceEnabled"
-	MsgPairError        = "pairError"
+	MsgPresence        = "presence"
+	MsgReadReceipt     = "readReceipt"
+	MsgReceivedMessage = "receivedMessage"
+	MsgCheckUser       = "checkUser"
+	MsgGetAvatar       = "getAvatar"
+	MsgGetAvatarFail   = "getAvatarFail"
+	MsgLoginSuccess    = "loginSuccess"
+	MsgPushName        = "pushName"
+	MsgPhoneNumber     = "phoneNumber"
+	MsgQrCode          = "qrCode"
+	MsgLinkingCode     = "linkingCode"
+	MsgQrTimeout       = "qrTimeout"
+	MsgLogoutSuccess   = "logoutSuccess"
+	MsgViewOnceFile    = "viewOnceFile"
+	MsgViewOnceEnabled = "viewOnceEnabled"
+	MsgPairError       = "pairError"
 
 	// Stability monitoring messages
 	MsgHeartbeat      = "heartbeat"      // Periodic health report (goroutines, memory, subscribers)
@@ -40,8 +39,8 @@ const (
 )
 
 // protoBackend abstracts where ProtoOutput writes protocol messages.
-// In daemon mode (Unix socket), messages go to the currently-connected Java client;
-// in legacy mode (Windows local / no --socket), messages go to stdout.
+// Java 统一走 daemon 模式（--socket）：消息写回当前连接的 Java client；
+// 仅手动终端调试（未传 --socket）时回退到 stdout。
 //
 // 关键约束：Java 重启时 socket 断开，写失败必须静默忽略，绝不 panic 或阻塞事件 handler
 // goroutine——Java 重连后 backend 切到新 conn 继续写。
@@ -49,7 +48,7 @@ type protoBackend interface {
 	write(line string)
 }
 
-// stdoutBackend writes to os.Stdout (legacy stdin/stdout pipe mode).
+// stdoutBackend writes to os.Stdout (manual terminal debugging without --socket).
 type stdoutBackend struct{}
 
 func (stdoutBackend) write(line string) {
@@ -58,9 +57,11 @@ func (stdoutBackend) write(line string) {
 
 // socketBackend writes to the current Java client connection.
 // Writes are guarded by a mutex to prevent interleaving across event-handler goroutines.
+// 注意：不能用 atomic.Value 存连接——Go 禁止 Store/Swap nil 进 Value（会 panic），
+// 而 Java 断开连接时需要清空字段，故用普通 net.Conn 字段 + mutex 即可（所有访问已持锁）。
 type socketBackend struct {
 	mu   sync.Mutex
-	conn atomic.Value // net.Conn
+	conn net.Conn
 }
 
 var globalSocketBackend = &socketBackend{}
@@ -68,33 +69,29 @@ var globalSocketBackend = &socketBackend{}
 // setProtoConn installs the connection used by the socket backend (Java attached/re-attached).
 func setProtoConn(conn net.Conn) {
 	globalSocketBackend.mu.Lock()
-	old := globalSocketBackend.conn.Load()
-	globalSocketBackend.conn.Store(conn)
+	old := globalSocketBackend.conn
+	globalSocketBackend.conn = conn
 	globalSocketBackend.mu.Unlock()
 	if old != nil {
-		if c, ok := old.(net.Conn); ok && c != nil {
-			_ = c.Close()
-		}
+		_ = old.Close()
 	}
 }
 
 // clearProtoConn drops the current connection (Java disconnected).
 func clearProtoConn() {
 	globalSocketBackend.mu.Lock()
-	old := globalSocketBackend.conn.Swap(nil)
+	old := globalSocketBackend.conn
+	globalSocketBackend.conn = nil
 	globalSocketBackend.mu.Unlock()
 	if old != nil {
-		if c, ok := old.(net.Conn); ok && c != nil {
-			_ = c.Close()
-		}
+		_ = old.Close()
 	}
 }
 
 func (b *socketBackend) write(line string) {
 	b.mu.Lock()
-	v := b.conn.Load()
+	conn := b.conn
 	b.mu.Unlock()
-	conn, _ := v.(net.Conn)
 	if conn == nil {
 		// No Java client connected yet (e.g., during Java restart). Drop silently —
 		// Java will re-attach; critical events like loginSuccess are re-driven by
@@ -106,9 +103,8 @@ func (b *socketBackend) write(line string) {
 	if err != nil {
 		// Connection broken — drop this conn; Java will reconnect and re-attach.
 		b.mu.Lock()
-		cur := b.conn.Load()
-		if cur == conn {
-			globalSocketBackend.conn.Store(nil)
+		if b.conn == conn {
+			b.conn = nil
 		}
 		b.mu.Unlock()
 		_ = conn.Close()

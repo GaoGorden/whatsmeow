@@ -61,10 +61,10 @@ var dbAddress = flag.String("db-address", "file:mdtest.db?_foreign_keys=on", "Da
 var requestFullSync = flag.Bool("request-full-sync", false, "Request full (1 year) history sync when logging in?")
 
 // socketPath: Unix domain socket 路径，由 Java Server 通过命令行参数传入。
-// 传了该参数则 Go 进程进入 daemon 模式：命令从 socket 接收、ProtoOutput 事件写回 socket，
-// 不再依赖 stdin/stdout 管道（Java 重启时 Go 不受影响、可被重新 attach）。留空则回退到旧的
-// stdin/stdout 管道模式（Windows 本地联调用）。
-var socketPath = flag.String("socket", "", "Unix domain socket path for Java IPC (daemon mode). Empty = legacy stdin/stdout mode.")
+// Java Server 在 Windows 与 Linux 上统一传入 --socket（Windows 测试 = Linux 生产同一套逻辑）：
+// Go 进入 daemon 模式，命令从 socket 接收、ProtoOutput 事件写回 socket，Java 重启时 Go 不受
+// 影响、可被重新 attach。留空则回退到 stdin/stdout 管道模式（仅手动终端调试用，Java 不再走该路径）。
+var socketPath = flag.String("socket", "", "Unix domain socket path for Java IPC (daemon mode). Empty = legacy stdin/stdout mode (manual debugging only).")
 
 // daemonMode: 是否处于 daemon 模式（socketPath 非空）。启动早期根据 flag 设置。
 var daemonMode = false
@@ -248,10 +248,10 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
 	if daemonMode {
-		// daemon 模式：从 Unix socket 接收 Java 命令，事件也通过 socket 回写
+		// daemon 模式（Java 统一走此路径）：从 Unix socket 接收 Java 命令，事件也通过 socket 回写
 		startCommandSocket(input, *socketPath)
 	} else {
-		// 旧模式（Windows 本地联调 / 未传 --socket）：从 stdin 读命令
+		// 回退模式（仅手动终端调试用，Java 不再走此路径）：从 stdin 读命令
 		go func() {
 			defer close(input)
 			scan := bufio.NewScanner(os.Stdin)
