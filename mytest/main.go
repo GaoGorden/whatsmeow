@@ -8,24 +8,27 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
-	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
@@ -37,13 +40,6 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
-	"gopkg.in/yaml.v3"
-
-	// amazon s3
-	"bytes"
-
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/gabriel-vasile/mimetype"
 
@@ -52,7 +48,6 @@ import (
 
 var cli *whatsmeow.Client
 var log waLog.Logger
-var s3Client *s3.Client
 
 var logLevel = "INFO"
 var debugLogs = flag.Bool("debug", false, "Enable debug logs?")
@@ -66,19 +61,13 @@ var requestFullSync = flag.Bool("request-full-sync", false, "Request full (1 yea
 // 影响、可被重新 attach。留空则回退到 stdin/stdout 管道模式（仅手动终端调试用，Java 不再走该路径）。
 var socketPath = flag.String("socket", "", "Unix domain socket path for Java IPC (daemon mode). Empty = legacy stdin/stdout mode (manual debugging only).")
 
+// serverUrl: Java Server 的 HTTP 基地址（http://host:port），用于请求 view-once 上传的 S3 预签名 PUT URL。
+// 由 Java Server 启动时通过 --server-url 传入；为空时 view-once 上传不可用（上传前会报错）。
+var serverUrl = flag.String("server-url", "", "Java Server HTTP base URL for presigned S3 upload. Empty = presign upload disabled.")
+
 // daemonMode: 是否处于 daemon 模式（socketPath 非空）。启动早期根据 flag 设置。
 var daemonMode = false
 var pairRejectChan = make(chan bool, 1)
-
-type Amazon struct {
-	KEY    string `yaml:"key"`
-	SECRET string `yaml:"secret"`
-	REGION string `yaml:"region"`
-}
-
-//go:embed amazon.yaml
-var configFile embed.FS
-var amazon Amazon
 
 var enableViewOnce = false
 
@@ -86,28 +75,24 @@ var device *store.Device
 var lid = ""
 var presenceMgr *PresenceManager
 
+// presenceBufferMax: presence 事件缓冲上限（条）。Java 掉线期间的事件存于此，
+// Java 重连后按序重放；超限丢最旧，latest 兜底保证每 JID 至少拿到当前状态。
+const presenceBufferMax = 1000
+
+// attachHandshakeTimeout: 连接用途握手超时。Java 完整 attach 连接首行发 "attach"，
+// Go 才设 ProtoOutput 后端并重放缓冲；命令/探测连接（sendCommand、health checker
+// probe）不设后端、不重放，避免提前消耗 PresenceCache 缓冲导致事件丢失。
+// 命令连接首行即命令、探测连接不发任何内容即关闭，均远快于 10s，超时仅作兜底。
+const attachHandshakeTimeout = 10 * time.Second
+
+// presenceCache: Java 掉线期间的上下线通知缓存，重连时重放。
+var presenceCache = NewPresenceCache(presenceBufferMax)
+
 func main() {
-
-	data, readErr := configFile.ReadFile("amazon.yaml")
-	if readErr != nil {
-		log.Errorf("can not read amazon.yaml: %v", readErr)
-	}
-
-	marshalErr := yaml.Unmarshal(data, &amazon)
-	if marshalErr != nil {
-		log.Errorf("can not marshal amazon.yaml: %v", marshalErr)
-	}
-
-	staticProvider := credentials.NewStaticCredentialsProvider(
-		amazon.KEY,
-		amazon.SECRET,
-		"",
-	)
-	cfg, _ := config.LoadDefaultConfig(context.Background(),
-		config.WithRegion(amazon.REGION),
-		config.WithCredentialsProvider(staticProvider),
-	)
-	s3Client = s3.NewFromConfig(cfg)
+	// 内存软上限：限制 Go 堆 + 运行时内存（不含跨进程共享的代码段），防止 view-once 下载/
+	// 历史同步等瞬时大分配把整机内存打穿。软上限（可临时小幅超出），过低会引发 GC 频繁，
+	// 64MB 对 view-once 媒体（下载 + 上传缓冲）足够。可在多个 Go 进程并行下载时限制节点峰值。
+	debug.SetMemoryLimit(64 << 20)
 
 	waBinary.IndentXML = true
 	flag.Parse()
@@ -229,6 +214,18 @@ func main() {
 		}
 	}()
 
+	// 周期重试暂存的 view-once 媒体（attach 触发为主，周期兜底覆盖重传失败/延迟场景；
+	// 仅在有 Java 客户端时执行，预签名依赖 Server 在线）
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if HasJavaClient() {
+				flushPendingUploads()
+			}
+		}
+	}()
+
 	cli.AddEventHandler(handler)
 	if device.ID != nil {
 		err = cli.Connect()
@@ -306,8 +303,10 @@ func startCommandSocket(input chan<- string, sockPath string) {
 	_ = os.Remove(sockPath)
 	l, err := net.Listen("unix", sockPath)
 	if err != nil {
+		// 静默 return 会让 main 循环空转阻塞在 input channel 上（僵尸 daemon）；
+		// 直接退出由 Java 端 ProcessUtils 检测进程死亡后走重启路径。
 		log.Errorf("Failed to listen on socket %s: %v", sockPath, err)
-		return
+		os.Exit(1)
 	}
 	// 限制权限：仅属主读写
 	_ = os.Chmod(sockPath, 0600)
@@ -320,15 +319,40 @@ func startCommandSocket(input chan<- string, sockPath string) {
 				// listener closed (daemon exiting)
 				return
 			}
-			// 新 Java 连接到来：设为 ProtoOutput 后端，旧连接会被 setProtoConn 关闭
-			setProtoConn(conn)
-			log.Infof("Java client connected from %s", conn.RemoteAddr())
-			go func(c net.Conn) {
+			// 连接用途握手（标记协议）：完整 attach 连接首行发 "attach" → 设后端 + 重放缓冲；
+			// 命令/探测连接（sendCommand、health checker probe）首行是命令或空 → 只喂命令、
+			// 不设后端、不重放。避免非 attach 连接提前消耗 PresenceCache 缓冲，导致 Java 掉线
+			// 窗口的事件写进无人读取的 socket 而永久丢失。
+			buf := bufio.NewReader(conn)
+			conn.SetReadDeadline(time.Now().Add(attachHandshakeTimeout))
+			first, readErr := buf.ReadString('\n')
+			conn.SetReadDeadline(time.Time{}) // 清除握手超时，进入正常读取
+			first = strings.TrimSpace(first)
+			isAttach := readErr == nil && first == "attach"
+			if isAttach {
+				// 新 Java attach：设为 ProtoOutput 后端，旧连接会被 setProtoConn 关闭。
+				// 先重放 Java 掉线期间缓存的上下线通知，再异步重传暂存的 view-once 媒体。
+				setProtoConn(conn)
+				presenceCache.Replay()
+				go flushPendingUploads()
+				log.Infof("Java client attached from %s", conn.RemoteAddr())
+			} else if readErr == nil && len(first) > 0 {
+				log.Debugf("command-only connection: %s", first)
+				input <- first
+			}
+			go func(c net.Conn, r *bufio.Reader) {
 				defer func() {
-					clearProtoConn()
+					// 仅当 c 仍是当前后端连接时才清空：旧连接读 goroutine 可能晚于新连接
+					// setProtoConn 执行，无条件 clearProtoConn 会把刚建立的新连接清掉，
+					// 导致事件全部转入缓冲且永不重放（与 socketBackend.write 错误路径同模式）。
+					globalSocketBackend.mu.Lock()
+					if globalSocketBackend.conn == c {
+						globalSocketBackend.conn = nil
+					}
+					globalSocketBackend.mu.Unlock()
 					_ = c.Close()
 				}()
-				scan := bufio.NewScanner(c)
+				scan := bufio.NewScanner(r)
 				scan.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 				for scan.Scan() {
 					line := strings.TrimSpace(scan.Text())
@@ -338,7 +362,7 @@ func startCommandSocket(input chan<- string, sockPath string) {
 				}
 				// client disconnected (Java restart) — daemon stays alive, waits for re-attach
 				log.Infof("Java client disconnected, daemon stays alive")
-			}(conn)
+			}(conn, buf)
 		}
 	}()
 }
@@ -586,7 +610,25 @@ func handleCmd(cmd string, args []string) {
 		}
 		if err := presenceMgr.Subscribe(args[0]); err != nil {
 			log.Errorf("Failed to subscribe presence for %s: %v", args[0], err)
+		} else {
+			// 重新订阅 = 取消退订标记（删除后重新添加的 observer 恢复事件处理）
+			presenceMgr.ClearUnsubscribed(args[0])
 		}
+	case "unsubscribepresence":
+		// 软退订（whatsmeow 无协议级 UnsubscribePresence，服务器侧订阅到下次连接周期
+		// ResubscribeAll 不再重订时自动停止）：
+		//   1. 移出 subscribedJIDs —— 重连后不再重订；
+		//   2. 标记退订 —— presence handler 跳过该 JID，不再缓存/重放；
+		//   3. 清空 PresenceCache —— 抹掉已滞留的该 JID 事件。
+		if len(args) < 1 {
+			log.Errorf("Usage: unsubscribepresence <jid>")
+			return
+		}
+		jid := args[0]
+		presenceMgr.Unsubscribe(jid)
+		presenceMgr.MarkUnsubscribed(jid)
+		presenceCache.Remove(jid)
+		log.Infof("Unsubscribed presence for %s", jid)
 	case "presence":
 		if len(args) == 0 {
 			log.Errorf("Usage: presence <available/unavailable>")
@@ -1527,23 +1569,28 @@ func handler(rawEvt interface{}) {
 			log.Debugf("%s was delivered to %s at %s", evt.MessageIDs[0], evt.SourceString(), evt.Timestamp)
 		}
 	case *events.Presence:
+		// 统一走 PresenceCache：Java 在线时即时送达，掉线时缓冲、重连后按序重放，
+		// 避免重启窗口内的上下线通知丢失。ts 记录事件发生时刻，供 Java 精确还原历史时间。
+		// ⚠️ 必须用 UTC 格式化（Java 端 lastSeenTimeToMillis 以 UTC 解析墙钟，
+		//    用本地时区会导致重放时间整体偏移）。lastSeen 同理。
 		result := searchPhoneNum(ctx, evt.From)
-
-		if evt.Unavailable {
-			data := map[string]any{
-				"state": "offline",
-				"jid":   result,
-			}
-			if !evt.LastSeen.IsZero() {
-				data["lastSeen"] = evt.LastSeen.Format("2006/01/02 15:04:05")
-			}
-			ProtoOutput(MsgPresence, data)
-		} else {
-			ProtoOutput(MsgPresence, map[string]any{
-				"state": "online",
-				"jid":   result,
-			})
+		// 已退订（删除/改号 observer）的 JID：直接跳过，不再缓存/重放。
+		// whatsmeow 无协议级退订，服务器可能在本连接周期内继续推流，本地过滤兜底。
+		if presenceMgr.IsUnsubscribed(result) {
+			return
 		}
+		pe := &presenceEvent{
+			state: "online",
+			jid:   result,
+			ts:    time.Now().UTC().Format(presenceTimeLayout),
+		}
+		if evt.Unavailable {
+			pe.state = "offline"
+			if !evt.LastSeen.IsZero() {
+				pe.lastSeen = evt.LastSeen.UTC().Format(presenceTimeLayout)
+			}
+		}
+		presenceCache.Handle(pe)
 	case *events.HistorySync:
 		id := atomic.AddInt32(&historySyncID, 1)
 		fileName := fmt.Sprintf("history-%d-%d.json", startupTime, id)
@@ -1616,24 +1663,23 @@ func searchJid(ctx context.Context, lid types.JID) types.JID {
 }
 
 func uploadAndNotify(observerId string, pushName string, fileName string, fileData []byte, fileLength uint64, seconds uint32) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	mType := mimetype.Detect(fileData)
 	miniType := mType.String()
-	objectKey := "whatsapp/view-once/" + cli.Store.GetJID().String() + "/" + fileName + mType.Extension()
-	bucket := "view-once"
+	objectKey := viewOnceObjectKey(fileName, mType.Extension())
 
-	_, err := s3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: &bucket,
-		Key:    &objectKey,
-		Body:   bytes.NewReader(fileData),
-	})
-	if err != nil {
-		return err
+	// 向 Java Server 请求 S3 预签名 PUT URL 再直接上传（不再内嵌 AWS SDK，减小二进制与内存）
+	if err := uploadToS3(objectKey, fileData, miniType); err != nil {
+		// 完整恢复：Java 掉线导致预签名申请/上传失败时，媒体暂存本地，重连后自动重传并通知
+		if saveErr := savePendingUpload(observerId, pushName, fileName, fileData, fileLength, seconds, miniType); saveErr != nil {
+			return fmt.Errorf("upload failed (%v) and pending save failed: %w", err, saveErr)
+		}
+		log.Warnf("view-once %s upload failed (%v), buffered to pending-upload for retry", fileName, err)
+		return nil
 	}
 
-	// 3. 通过协议输出通知 Java Server
-	ProtoOutput(MsgViewOnceFile, map[string]any{
+	// 通过协议输出通知 Java Server（走 PresenceCache.Notify：Java 掉线时缓冲、重连后重放，
+	// 避免 view-once 文件成为 S3 孤儿——媒体已上传但 Server 无记录）
+	presenceCache.Notify(MsgViewOnceFile, map[string]any{
 		"observerId": observerId,
 		"pushName":   pushName,
 		"miniType":   miniType,
@@ -1643,4 +1689,65 @@ func uploadAndNotify(observerId string, pushName string, fileName string, fileDa
 	})
 
 	return nil
+}
+
+// uploadToS3 请求 S3 预签名 PUT URL 并上传文件内容。
+func uploadToS3(objectKey string, data []byte, contentType string) error {
+	if *serverUrl == "" {
+		return fmt.Errorf("uploadToS3: --server-url not configured, cannot presign upload")
+	}
+	presigned, err := requestPresignedPut(objectKey)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPut, presigned, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", contentType)
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("S3 presigned PUT failed: %d %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// requestPresignedPut 向 Java Server 请求 S3 预签名 PUT URL（GET /inner/presignViewOnceUpload）。
+func requestPresignedPut(objectKey string) (string, error) {
+	// TrimRight 防 serverUrl 带尾斜杠产生双斜杠
+	reqURL := strings.TrimRight(*serverUrl, "/") + "/inner/presignViewOnceUpload?objectKey=" + url.QueryEscape(objectKey)
+	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request presign failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("request presign failed: %d %s", resp.StatusCode, string(body))
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", fmt.Errorf("presign response parse failed: %w", err)
+	}
+	if parsed.URL == "" {
+		return "", fmt.Errorf("presign response missing url: %s", string(body))
+	}
+	return parsed.URL, nil
 }

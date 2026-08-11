@@ -27,10 +27,12 @@
 | `proto_output.go` | Proto 协议输出封装（`ProtoOutput()` + `Msg*` 常量 + `protoBackend` 抽象：stdout/socket 双 backend，socket 断开静默忽略。⚠️ 连接字段用普通 `net.Conn` + mutex，**不能用 `atomic.Value`**——Go 禁止 Store/Swap nil 进 Value，`clearProtoConn()` 的 `Swap(nil)` 会导致 Java 断开连接时 panic、进程以退出码 2 崩溃，详见 `doc/Go进程daemon模式panic崩溃修复.md`） |
 | `daemon_linux.go` | Linux daemon 化（`syscall.Setsid()` + `signal.Ignore(SIGPIPE)`） |
 | `daemon_other.go` | 非 Linux daemon 化 no-op（Windows 联调用） |
-| `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅） |
+| `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅；含退订标记集 `unsubscribedJIDs`，支持软退订） |
+| `presence_cache.go` | **Presence 事件缓存与重放**：Java 掉线期间缓存上下线通知，重连后按序重放（含 `ts` 时间戳精确还原）；`Notify` 同时缓冲 view-once 等运行时通知；`Remove(jid)` 清空单 JID 缓存（软退订用）。详见 `doc/Go端presence事件缓存与重放方案.md`、`doc/Server重启窗口Observer操作与presence重放风险修复.md` |
+| `pending_upload.go` | **View-once 完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，attach/周期触发重传 + 补通知，上限 100 条。详见 `doc/Go进程内存优化与预签名上传方案.md`「完整恢复」 |
 | `main_new.go` | 原始上游示例代码（函数名改为 `maingg()`，不执行） |
 | `go.mod` | 独立 Go module，通过 `replace` 指向本地 whatsmeow 库 |
-| `amazon.yaml` | AWS S3 凭证配置（`//go:embed` 嵌入） |
+| `amazon.yaml` | ⚠️ **已废弃**：原 S3 凭证嵌入文件，方案B 后 Go 不再嵌入/引用（可删除，密钥改由 Server 侧 S3Config 统一持有） |
 
 ### mytest2/ — 多客户端 HTTP 版（新版/实验）
 
@@ -86,6 +88,9 @@ cli = whatsmeow.NewClient(device, log)
 3. 通过 `getNickName()` 获取联系人昵称（优先 FullName → PushName）
 4. 异步调用 `cli.Download()` 下载媒体
 5. `uploadAndNotify()` 上传到 S3 并输出 JSON 通知（`ProtoOutput(MsgViewOnceFile)`，Java Server 通过 socket/Proto 协议解析）
+   - **上传方式（方案B）**：Go 不再内嵌 AWS SDK，而是 `GET {server-url}/inner/presignViewOnceUpload?objectKey=...` 向 Java Server 申请 S3 预签名 PUT URL，再直接 HTTP PUT 上传。`--server-url` 由 Java 启动时传入。详见 `doc/Go进程内存优化与预签名上传方案.md`
+   - **完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，Java 重连后 `flushPendingUploads` 补传 + `presenceCache.Notify` 补通知（`pending_upload.go`）
+   - **内存优化（方案A）**：`main()` 开头 `debug.SetMemoryLimit(64<<20)` 设堆软上限，防 view-once 下载/历史同步瞬时大分配打穿节点
 
 **S3 上传路径**：`whatsapp/view-once/{userJID}/{messageID}{extension}`
 
@@ -169,7 +174,8 @@ Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一
 | `require-qrcode` | QR 码登录 |
 | `reconnect` | 断开并重连 |
 | `logout` | 登出 |
-| `subscribepresence <jid>` | 订阅联系人在线状态 |
+| `subscribepresence <jid>` | 订阅联系人在线状态（成功时清除退订标记） |
+| `unsubscribepresence <jid>` | **软退订**（whatsmeow 无协议级退订）：移出重订阅集 + 标记过滤 + 清空 PresenceCache，下个连接周期自动停推。删除/改号 observer 时由 Server 下发 |
 | `checkuser <phones...>` | 检查号码是否注册 WhatsApp |
 | `getavatar <jid>` | 获取头像 URL |
 | `getgroup <jid>` | 获取群组信息 |
@@ -268,7 +274,7 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 
 | 常量 | type 值 | 说明 |
 |------|--------|------|
-| `MsgPresence` | `presence` | 联系人在线/离线状态 |
+| `MsgPresence` | `presence` | 联系人在线/离线状态（`state`/`jid`/`lastSeen`/可选 `ts`，统一经 `PresenceCache` 输出；掉线期间缓冲、重连重放） |
 | `MsgReadReceipt` | `readReceipt` | 消息已读回执 |
 | `MsgReceivedMessage` | `receivedMessage` | 收到消息通知 |
 | `MsgCheckUser` | `checkUser` | 号码检查结果 |
@@ -290,7 +296,9 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 | `MsgLoggedOut` | `loggedOut` | 服务端登出 |
 
 **稳定性机制**：
-- **PresenceManager**（`presence_manager.go`）：跟踪所有已订阅的联系人 JID，`events.Connected` 时自动调用 `ResubscribeAll()` 重订阅
+- **连接用途标记协议**（`startCommandSocket` accept 循环）：首行发 `attach` 的连接才 `setProtoConn + Replay + flushPendingUploads`；命令/探测连接（sendCommand、health checker probe）只喂命令、不设后端、不重放——避免非 attach 连接提前消耗 PresenceCache 缓冲导致事件写进无人读取的 socket 而丢失。⚠️ **部署顺序：Java 先于 Go**（旧 Java + 新 Go 断裂）。见 `doc/Server重启窗口Observer操作与presence重放风险修复.md`
+- **PresenceManager**（`presence_manager.go`）：跟踪所有已订阅的联系人 JID，`events.Connected` 时自动调用 `ResubscribeAll()` 重订阅；含退订标记集（`MarkUnsubscribed/ClearUnsubscribed/IsUnsubscribed`），软退订时 presence handler 跳过该 JID
+- **PresenceCache**（`presence_cache.go`）：Java 掉线期间的事件重放缓存，覆盖两类事件——① presence（`Handle`）：先入缓冲，Java 在线立即排空、掉线留存，attach 后 `Replay()` 按序重放 + 溢出 JID latest 兜底，重放/实时均带 `ts` 还原历史时间；② 运行时通知（`Notify`，view-once 等）：纯 FIFO，`uploadAndNotify` 走 `Notify` 防 S3 孤儿，溢出记 ERROR；`Remove(jid)` 软退订时清空单 JID 滞留事件
 - **心跳**：每 60 秒输出 `heartbeat`，上报 goroutine 数、内存使用、订阅数、运行时间
 - **StreamReplaced 处理**：发送 Proto 通知 → `cli.Disconnect()` → `time.Sleep(3s)` → `os.Exit(42)`
 - **LoggedOut 处理**：发送 Proto 通知 → `cli.Disconnect()` → `time.Sleep(3s)` → `os.Exit(43)`
@@ -310,7 +318,7 @@ whatsmeow 库自身的 `log.Errorf` / `log.Warnf` 输出仍为纯文本行，Jav
 
 ### 运行时配置
 
-- **`amazon.yaml`**（嵌入）：AWS S3 凭证（key、secret、region）
+- ~~**`amazon.yaml`**~~（已废弃，不再嵌入）：AWS S3 凭证改由 Server 侧持有，Go 通过预签名 URL 上传
 - **`WaClientInfo.json`**（mytest2 用）：用户文件目录路径
 - **SQLite DB**：每个用户独立 `mdtest.db`，存储密钥、联系人、会话等
 
@@ -323,7 +331,7 @@ whatsmeow 库自身的 `log.Errorf` / `log.Warnf` 输出仍为纯文本行，Jav
 | `github.com/rs/zerolog` | 结构化日志 |
 | `google.golang.org/protobuf` | Protobuf 序列化 |
 | `github.com/mattn/go-sqlite3` | SQLite 驱动（CGO） |
-| `github.com/aws/aws-sdk-go-v2` | S3 上传（ViewOnce 媒体） |
+| ~~`github.com/aws/aws-sdk-go-v2`~~ | ~~S3 上传（ViewOnce 媒体）~~ 已移除（方案B：改用 Server 预签名 URL） |
 | `github.com/gabriel-vasile/mimetype` | MIME 类型检测 |
 | `github.com/gin-gonic/gin` | HTTP API（mytest2） |
 | `github.com/beeper/argo-go` | Argo 查询协议 |
@@ -395,4 +403,4 @@ git commit -m "sync: merge upstream changes"
 9. **argo 目录**：包含自定义的 Argo 协议查询定义，嵌入了 `.argo` 和 `.json` 文件
 10. **跨仓库联动**：修改 Proto 消息格式或 Go↔Java 通信协议后，检查 `watracker-server/CLAUDE.md` 是否需要同步更新（根目录 CLAUDE.md 的「文档同步」规则）
 11. **history JSON 文件**：根目录有大量 `history-*.json` 文件，是 HistorySync 事件的调试输出，生产环境可忽略或清理
-12. **`amazon.yaml` 包含 S3 密钥**：注意不要泄露
+12. ~~**`amazon.yaml` 包含 S3 密钥**~~：方案B 后 Go 不再嵌入/使用，S3 密钥集中在 Server 侧；旧密钥若曾随二进制/仓库分发建议在 AWS 轮换一次

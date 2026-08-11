@@ -15,13 +15,19 @@ import (
 type PresenceManager struct {
 	mu             sync.RWMutex
 	subscribedJIDs map[string]bool // key: full JID string (e.g. "447743009263@s.whatsapp.net")
-	cli            *whatsmeow.Client
+	// unsubscribedJIDs: 显式退订的 JID（删除/改号 observer）。whatsmeow 无协议级
+	// UnsubscribePresence，采用软退订：移出 subscribedJIDs（下个连接周期 ResubscribeAll
+	// 不再重订，服务器自动停推）+ 标记过滤（main.go presence handler 跳过该 JID，不再
+	// 缓存/重放）。重新 subscribepresence 时 ClearUnsubscribed 恢复。
+	unsubscribedJIDs map[string]bool
+	cli              *whatsmeow.Client
 }
 
 func NewPresenceManager(cli *whatsmeow.Client) *PresenceManager {
 	return &PresenceManager{
-		subscribedJIDs: make(map[string]bool),
-		cli:            cli,
+		subscribedJIDs:   make(map[string]bool),
+		unsubscribedJIDs: make(map[string]bool),
+		cli:              cli,
 	}
 }
 
@@ -45,6 +51,28 @@ func (pm *PresenceManager) Unsubscribe(jidStr string) {
 	pm.mu.Lock()
 	delete(pm.subscribedJIDs, jidStr)
 	pm.mu.Unlock()
+}
+
+// MarkUnsubscribed 标记某 JID 已退订：main.go 的 presence handler 将跳过该 JID 的事件
+// （不再缓存/重放）。配合 Unsubscribe 使用（退订 = 移出重订阅集合 + 标记过滤）。
+func (pm *PresenceManager) MarkUnsubscribed(jidStr string) {
+	pm.mu.Lock()
+	pm.unsubscribedJIDs[jidStr] = true
+	pm.mu.Unlock()
+}
+
+// ClearUnsubscribed 取消退订标记（重新 subscribepresence 时调用，恢复事件处理）。
+func (pm *PresenceManager) ClearUnsubscribed(jidStr string) {
+	pm.mu.Lock()
+	delete(pm.unsubscribedJIDs, jidStr)
+	pm.mu.Unlock()
+}
+
+// IsUnsubscribed 返回该 JID 是否已显式退订。
+func (pm *PresenceManager) IsUnsubscribed(jidStr string) bool {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.unsubscribedJIDs[jidStr]
 }
 
 // ResubscribeAll re-subscribes to all tracked JIDs with a 300ms delay between each

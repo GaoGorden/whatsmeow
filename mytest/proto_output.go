@@ -78,14 +78,20 @@ func setProtoConn(conn net.Conn) {
 }
 
 // clearProtoConn drops the current connection (Java disconnected).
+// 仅用于测试重置；生产路径（读 goroutine）请用 startCommandSocket 内的受控清理，
+// 避免旧连接 defer 晚于新连接 setProtoConn 时清掉新连接。
 func clearProtoConn() {
 	globalSocketBackend.mu.Lock()
-	old := globalSocketBackend.conn
 	globalSocketBackend.conn = nil
 	globalSocketBackend.mu.Unlock()
-	if old != nil {
-		_ = old.Close()
-	}
+}
+
+// HasJavaClient reports whether a Java client connection is currently installed.
+// Used by PresenceCache.Handle to decide whether to deliver immediately or buffer for replay.
+func HasJavaClient() bool {
+	globalSocketBackend.mu.Lock()
+	defer globalSocketBackend.mu.Unlock()
+	return globalSocketBackend.conn != nil
 }
 
 func (b *socketBackend) write(line string) {
