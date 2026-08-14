@@ -97,6 +97,13 @@ func main() {
 	waBinary.IndentXML = true
 	flag.Parse()
 
+	// log 提前初始化：daemon 模式下 startCommandSocket 的 log.Infof 依赖 log 已就绪
+	// （socket 前置到 cli.Connect 之前，不能等 log 在后面才初始化，否则 nil logger panic）
+	if *debugLogs {
+		logLevel = "DEBUG"
+	}
+	log = waLog.Stdout("Main", logLevel, true)
+
 	// daemon 模式判定：传了 --socket 即进入 daemon 模式
 	daemonMode = *socketPath != ""
 	// 提前声明，供 daemon 模式 socket 前置启动与主循环共用（非 daemon 模式在后面初始化）
@@ -118,9 +125,6 @@ func main() {
 		startCommandSocket(input, *socketPath)
 	}
 
-	if *debugLogs {
-		logLevel = "DEBUG"
-	}
 	if *requestFullSync {
 		store.DeviceProps.RequireFullSync = proto.Bool(true)
 		store.DeviceProps.HistorySyncConfig = &waProto.DeviceProps_HistorySyncConfig{
@@ -129,7 +133,6 @@ func main() {
 			StorageQuotaMb:      proto.Uint32(102400),
 		}
 	}
-	log = waLog.Stdout("Main", logLevel, true)
 
 	// 启动时打印协议版本与设备指纹，便于排查风控问题
 	waVer := store.GetWAVersion()
