@@ -99,13 +99,23 @@ func main() {
 
 	// daemon 模式判定：传了 --socket 即进入 daemon 模式
 	daemonMode = *socketPath != ""
+	// 提前声明，供 daemon 模式 socket 前置启动与主循环共用（非 daemon 模式在后面初始化）
+	var c chan os.Signal
+	var input chan string
 	if daemonMode {
 		// daemon 化（Linux: setsid 脱离 JVM 进程组 + 忽略 SIGPIPE；非 Linux: no-op）
 		// 配合 systemd KillMode=process 让 Go 在 Java 重启时存活
 		daemonize()
 		// ProtoOutput 事件从 stdout 改写 Unix socket（Java 重启时 stdout pipe 会断，必须迁通道）
 		setDaemonBackend()
-		// socket 监听在下方 input channel 声明后启动（startCommandSocket 需要喂入 input）
+		// 【修复】socket 创建前置：在 cli.Connect()（首次连接 WhatsApp 可能数十秒）之前
+		// 尽早监听 Unix socket，避免 Java 端 8 秒 attach 等待窗口被 WhatsApp 连接占满而误判
+		// 启动失败。accept 循环在 goroutine 内不阻塞主流程；命令经无缓冲 input channel
+		// 暂存，主循环启动后消费，不丢失。
+		input = make(chan string)
+		c = make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		startCommandSocket(input, *socketPath)
 	}
 
 	if *debugLogs {
@@ -238,16 +248,13 @@ func main() {
 		log.Infof("Device not logged in. Use 'require-qrcode' or 'pair-phone' to log in.")
 	}
 
-	c := make(chan os.Signal, 1)
-	input := make(chan string)
-	// daemon 模式下命令由 startCommandSocket 启动的 accept goroutine 喂入 input channel；
-	// 旧模式下由下方 stdin goroutine 喂入。signal 两个模式都注册。
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-	if daemonMode {
-		// daemon 模式（Java 统一走此路径）：从 Unix socket 接收 Java 命令，事件也通过 socket 回写
-		startCommandSocket(input, *socketPath)
-	} else {
+	// daemon 模式下命令由 startCommandSocket 的 accept goroutine 喂入 input channel
+	// （socket 已在前方 daemon 初始化块中前置启动）；非 daemon 模式在这里初始化 signal
+	// 与 stdin goroutine（仅手动终端调试用）。
+	if !daemonMode {
+		c = make(chan os.Signal, 1)
+		input = make(chan string)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		// 回退模式（仅手动终端调试用，Java 不再走此路径）：从 stdin 读命令
 		go func() {
 			defer close(input)
