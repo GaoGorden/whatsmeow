@@ -124,6 +124,28 @@ func (cli *Client) SubscribePresence(ctx context.Context, jid types.JID) error {
 	return cli.sendNode(ctx, req)
 }
 
+// UnsubscribePresence asks the WhatsApp servers to stop sending presence updates of a specific user.
+//
+// whatsmeow 上游没有协议级退订，但 wa 协议接受 <presence type="unsubscribe"> 节点（见
+// oxidezap/whatsapp-rust#343：WhatsApp Web 支持该节点并停止该联系人的 presence 推送）。
+// 我们在 observer 删除/改号时使用它：软退订（仅本地标记）不会移除服务器侧订阅，导致
+// 「删除后重新添加相同 observer」时 subscribe 被服务器视为已订阅的冗余请求、不重推当前
+// presence，新 observer 的 onlineState 卡死在 isReading。先协议退订再订阅，强制服务器把
+// 后续 SubscribePresence 当作全新订阅处理并重推当前状态。
+func (cli *Client) UnsubscribePresence(ctx context.Context, jid types.JID) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	req := waBinary.Node{
+		Tag: "presence",
+		Attrs: waBinary.Attrs{
+			"type": "unsubscribe",
+			"to":   jid,
+		},
+	}
+	return cli.sendNode(ctx, req)
+}
+
 // SendChatPresence updates the user's typing status in a specific chat.
 //
 // The media parameter can be set to indicate the user is recording media (like a voice message) rather than typing a text message.

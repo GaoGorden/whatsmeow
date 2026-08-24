@@ -23,12 +23,12 @@
 
 | 文件 | 说明 |
 |------|------|
-| `main.go` | 【核心】生产入口，包含完整的事件处理、命令系统、daemon 化（`--socket` flag + `daemonize()` + `startCommandSocket`） |
+| `main.go` | 【核心】生产入口，包含完整的事件处理、命令系统、daemon 化（`--socket` flag + `daemonize()` + `startCommandSocket`）。⚠️ `OnLoginSuccess` 回调由 `loginSuccessNotified` atomic.Bool 限定为进程**首次连接**上报（whatsmeow 每次连接成功都触发该回调，重连时重发 pushName/phoneNumber/loginSuccess 会造成 Java 端「假重登」日志；重连后的订阅恢复由 `ResubscribeAll` + 粘性订阅负责） |
 | `proto_output.go` | Proto 协议输出封装（`ProtoOutput()` + `Msg*` 常量 + `protoBackend` 抽象：stdout/socket 双 backend，socket 断开静默忽略。⚠️ 连接字段用普通 `net.Conn` + mutex，**不能用 `atomic.Value`**——Go 禁止 Store/Swap nil 进 Value，`clearProtoConn()` 的 `Swap(nil)` 会导致 Java 断开连接时 panic、进程以退出码 2 崩溃，详见 `doc/Go进程daemon模式panic崩溃修复.md`） |
 | `daemon_linux.go` | Linux daemon 化（`syscall.Setsid()` + `signal.Ignore(SIGPIPE)`） |
 | `daemon_other.go` | 非 Linux daemon 化 no-op（Windows 联调用） |
-| `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅；含退订标记集 `unsubscribedJIDs`，支持软退订） |
-| `presence_cache.go` | **Presence 事件缓存与重放**：Java 掉线期间缓存上下线通知，重连后按序重放（含 `ts` 时间戳精确还原）；`Notify` 同时缓冲 view-once 等运行时通知；`Remove(jid)` 清空单 JID 缓存（软退订用）。详见 `doc/Go端presence事件缓存与重放方案.md`、`doc/Server重启窗口Observer操作与presence重放风险修复.md` |
+| `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅；含退订标记集 `unsubscribedJIDs`，软退订 + 协议退订（`UnsubscribePresence`，**实测无效**，best-effort）双层；`Subscribe` 为**粘性订阅**——断线发送失败也记录 JID，重连后 `ResubscribeAll` 补发；`MarkPriority` **优先重订阅**重加 JID（ResubscribeAll 先发它，避免 map 随机顺序把重加 JID 排到最后拖慢恢复）；重加 observer 靠 2s 无推送强制重连兜底） |
+| `presence_cache.go` | **Presence 事件缓存与重放**：Java 掉线期间缓存上下线通知，重连后按序重放（含 `ts` 时间戳精确还原）；`Notify` 同时缓冲 view-once 等运行时通知；`Remove(jid)` 清空单 JID 缓存（软退订用）；`lastArrival`/`HasFreshEvent` 供重加订阅后 2s 无推送判定（触发强制重连兜底）。详见 `doc/Go端presence事件缓存与重放方案.md`、`doc/Server重启窗口Observer操作与presence重放风险修复.md` |
 | `pending_upload.go` | **View-once 完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，attach/周期触发重传 + 补通知，上限 100 条。详见 `doc/Go进程内存优化与预签名上传方案.md`「完整恢复」 |
 | `main_new.go` | 原始上游示例代码（函数名改为 `maingg()`，不执行） |
 | `go.mod` | 独立 Go module，通过 `replace` 指向本地 whatsmeow 库 |
@@ -162,6 +162,8 @@ WhatsApp 使用 LID（Linked ID）代替真实电话号码，需要反查：
 - 输出 `push name` 和 `phone number`（Java Server 解析为登录成功标记）
 - 解析自己的 LID
 
+- **配对码过期（~160s）**：whatsmeow 二维码耗尽后 WhatsApp 服务器会关闭登录 websocket（`pair-code.go`："160-second time limit"）；登录期 `cli.Store.ID==nil` → `autoReconnect`（client.go:618）直接 return **不重连**，进程保持断开。`handler()` 的 `*events.Disconnected` 分支检测到「登录期断开」（`!cli.IsLoggedIn()`，登录成功后运行期重连不命中）即输出 `MsgPairError`（`pairError`）→ Java 走既有 pairError 分支（ProcessUtils:661）下发 loginTimeout → App 立即显示「配对码已过期，重新发送」，**对齐真实配对码过期时刻**（~160s），而非等 Server 5 分钟 emitter 超时。QR 流程不受影响：`qrchan.go` QR 码耗尽走 `cli.Disconnect()`（预期断开，onDisconnect 不派发 Disconnected），QR 超时仍由 `qrTimeout` 处理。详见 `doc/登录超时与配对码过期对齐方案.md`
+
 ### 5. 命令系统（socket 交互）
 
 Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一致）。命令集：
@@ -174,8 +176,8 @@ Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一
 | `require-qrcode` | QR 码登录 |
 | `reconnect` | 断开并重连 |
 | `logout` | 登出 |
-| `subscribepresence <jid>` | 订阅联系人在线状态（成功时清除退订标记） |
-| `unsubscribepresence <jid>` | **软退订**（whatsmeow 无协议级退订）：移出重订阅集 + 标记过滤 + 清空 PresenceCache，下个连接周期自动停推。删除/改号 observer 时由 Server 下发 |
+| `subscribepresence <jid>` | 订阅联系人在线状态（粘性订阅：即使断线发送失败也记录 JID，重连后 `ResubscribeAll` 补发；发送失败不再阻断，`ClearUnsubscribed` 始终执行）。**重加 JID（仍带退订标记）先协议退订（实测无效，best-effort）再订阅**；2s 内无推送则强制重连兜底（重连为唯一可靠重推机制） |
+| `unsubscribepresence <jid>` | **协议退订 + 软退订双层**：① 协议退订（`UnsubscribePresence` 发 `<presence type=unsubscribe>`，whatsmeow 上游无此 API，**实测无效**——服务器不响应停推→重推语义，仅 best-effort）；② 软退订（移出重订阅集 + 标记过滤 + 清空 PresenceCache）。删除/改号 observer 时由 Server 下发 |
 | `checkuser <phones...>` | 检查号码是否注册 WhatsApp |
 | `getavatar <jid>` | 获取头像 URL |
 | `getgroup <jid>` | 获取群组信息 |
@@ -297,8 +299,8 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 
 **稳定性机制**：
 - **连接用途标记协议**（`startCommandSocket` accept 循环）：首行发 `attach` 的连接才 `setProtoConn + Replay + flushPendingUploads`；命令/探测连接（sendCommand、health checker probe）只喂命令、不设后端、不重放——避免非 attach 连接提前消耗 PresenceCache 缓冲导致事件写进无人读取的 socket 而丢失。⚠️ **部署顺序：Java 先于 Go**（旧 Java + 新 Go 断裂）。见 `doc/Server重启窗口Observer操作与presence重放风险修复.md`
-- **PresenceManager**（`presence_manager.go`）：跟踪所有已订阅的联系人 JID，`events.Connected` 时自动调用 `ResubscribeAll()` 重订阅；含退订标记集（`MarkUnsubscribed/ClearUnsubscribed/IsUnsubscribed`），软退订时 presence handler 跳过该 JID
-- **PresenceCache**（`presence_cache.go`）：Java 掉线期间的事件重放缓存，覆盖两类事件——① presence（`Handle`）：先入缓冲，Java 在线立即排空、掉线留存，attach 后 `Replay()` 按序重放 + 溢出 JID latest 兜底，重放/实时均带 `ts` 还原历史时间；② 运行时通知（`Notify`，view-once 等）：纯 FIFO，`uploadAndNotify` 走 `Notify` 防 S3 孤儿，溢出记 ERROR；`Remove(jid)` 软退订时清空单 JID 滞留事件
+- **PresenceManager**（`presence_manager.go`）：跟踪所有已订阅的联系人 JID，`events.Connected` 时自动调用 `ResubscribeAll()` 重订阅；含退订标记集（`MarkUnsubscribed/ClearUnsubscribed/IsUnsubscribed`），软退订时 presence handler 跳过该 JID；`Subscribe` 为**粘性订阅**（断线发送失败也记录 JID，重连后 `ResubscribeAll` 补发，替代 Java `loginSuccess→checkObservers` 补订）。重加 JID 流程：`UnsubscribePresence`（**实测无效**，best-effort）→ 订阅 → 2s 内无推送则强制重连兜底（**重连是唯一可靠机制**，重连后 `ResubscribeAll` 全量重订必然重推）
+- **PresenceCache**（`presence_cache.go`）：Java 掉线期间的事件重放缓存，覆盖两类事件——① presence（`Handle`）：先入缓冲，Java 在线立即排空、掉线留存，attach 后 `Replay()` 按序重放 + 溢出 JID latest 兜底，重放/实时均带 `ts` 还原历史时间；② 运行时通知（`Notify`，view-once 等）：纯 FIFO，`uploadAndNotify` 走 `Notify` 防 S3 孤儿，溢出记 ERROR；`Remove(jid)` 软退订时清空单 JID 滞留事件；`lastArrival`/`HasFreshEvent(jid,since)` 记录每 JID 最近实时事件到达时刻，供重加订阅后的新鲜度校验（2s 无推送 → 强制重连兜底，协议退订实测无效，重连是唯一可靠重推机制）
 - **心跳**：每 60 秒输出 `heartbeat`，上报 goroutine 数、内存使用、订阅数、运行时间
 - **StreamReplaced 处理**：发送 Proto 通知 → `cli.Disconnect()` → `time.Sleep(3s)` → `os.Exit(42)`
 - **LoggedOut 处理**：发送 Proto 通知 → `cli.Disconnect()` → `time.Sleep(3s)` → `os.Exit(43)`

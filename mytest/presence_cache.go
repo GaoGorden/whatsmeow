@@ -1,6 +1,9 @@
 package main
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // presenceTimeLayout 与 Java 端 Constants.LAST_SEEN_TIME_FORMAT（"yyyy/MM/dd HH:mm:ss"）一致，
 // 使 ts / lastSeen 可直接被 Java 的 TimeUtils.lastSeenTimeToMillis 解析。
@@ -38,6 +41,10 @@ type PresenceCache struct {
 	latest map[string]*presenceEvent // 每 JID 最新状态（key: jid）
 	buffer []*presenceEvent          // FIFO 未送达 presence 事件
 	maxBuf int
+	// lastArrival: 每 JID 最近一条实时事件到达时刻（wall clock）。
+	// 供 re-add 订阅后的新鲜度校验：协议退订+重订后，若 5 秒内仍无该 JID 事件，
+	// 判定服务器未采纳退订、未重推当前 presence，触发重连兜底。
+	lastArrival map[string]time.Time
 	// droppedJIDs: 因 buffer 溢出被挤出、且未被后续事件覆盖的 JID。
 	// 用于 Replay 时对这些 JID 补发当前状态，避免「已送达的 JID」被 latest 误补发造成重复。
 	droppedJIDs map[string]bool
@@ -51,6 +58,7 @@ func NewPresenceCache(maxBuf int) *PresenceCache {
 		latest:       make(map[string]*presenceEvent),
 		buffer:       make([]*presenceEvent, 0, 16),
 		maxBuf:       maxBuf,
+		lastArrival:  make(map[string]time.Time),
 		droppedJIDs:  make(map[string]bool),
 		notifyEvents: make([]*notifyEvent, 0, 8),
 		maxNotify:    1000,
@@ -64,6 +72,7 @@ func NewPresenceCache(maxBuf int) *PresenceCache {
 func (pc *PresenceCache) Handle(evt *presenceEvent) {
 	pc.mu.Lock()
 	pc.latest[evt.jid] = evt
+	pc.lastArrival[evt.jid] = time.Now()
 	pc.buffer = append(pc.buffer, evt)
 	if pc.maxBuf > 0 && len(pc.buffer) > pc.maxBuf {
 		// 丢弃最旧事件，并记录该 JID 供 Replay 的 latest 兜底（防当前状态缺失）
@@ -112,6 +121,7 @@ func (pc *PresenceCache) Notify(msgType string, data map[string]any) {
 func (pc *PresenceCache) Remove(jid string) {
 	pc.mu.Lock()
 	delete(pc.latest, jid)
+	delete(pc.lastArrival, jid)
 	delete(pc.droppedJIDs, jid)
 	kept := pc.buffer[:0]
 	for _, pe := range pc.buffer {
@@ -121,6 +131,18 @@ func (pc *PresenceCache) Remove(jid string) {
 	}
 	pc.buffer = kept
 	pc.mu.Unlock()
+}
+
+// HasFreshEvent 返回自 since 之后该 JID 是否收到过实时 presence 事件。
+// 用于 re-add 订阅后的新鲜度校验：协议退订+重订后服务器应重推当前 presence，
+// 若 5 秒内仍无事件则判定退订未生效，交由上层强制重连兜底（重连后 ResubscribeAll
+// 全量重订，服务器必然重推）。重放路径（Replay → emitPresence）不经 Handle，
+// 不更新 lastArrival，避免重放旧事件被误判为「新推送」。
+func (pc *PresenceCache) HasFreshEvent(jid string, since time.Time) bool {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+	t, ok := pc.lastArrival[jid]
+	return ok && t.After(since)
 }
 
 // Replay 在 Java 重连（setProtoConn 之后）调用：按 FIFO 序排空重放缓冲事件；

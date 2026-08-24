@@ -186,7 +186,18 @@ func main() {
 		log.Infof("Accepting pair")
 		return true
 	}
+	// loginSuccessNotified：登录阶段 proto（pushName/phoneNumber/loginSuccess）只在进程
+	// 生命周期内第一次连接成功时上报一次。whatsmeow 的 OnLoginSuccess 在每次连接成功
+	// （含重连）都会触发（connectionevents.go handleConnectSuccess），若每次重连都重发，
+	// Java 端会把它当作「重新登录」日志，但实际只是断线/重连后的重复上报（Java 对重复
+	// loginSuccess 有守卫：isLogin/isOnline 已满足则跳过重登录副作用，仅重跑 checkObservers）。
+	// 为避免误读为「假重登」，重连不再重发登录阶段 proto；重连后的订阅恢复由
+	// ResubscribeAll（resubscribe proto）负责，断线窗口内丢失的订阅由粘性订阅兜底。
+	var loginSuccessNotified atomic.Bool
 	cli.OnLoginSuccess = func() {
+		if !loginSuccessNotified.CompareAndSwap(false, true) {
+			return
+		}
 		printUserInfo()
 		ProtoOutput(MsgLoginSuccess, map[string]any{})
 		parseRealLid()
@@ -455,6 +466,9 @@ func handleCmd(cmd string, args []string) {
 			err := cli.Connect()
 			if err != nil {
 				log.Errorf("Failed to connect: %v", err)
+				// 连接失败也必须通知 Java（pairError → loginTimeout），否则 SSE 会一直挂起，
+				// 后续同手机号重试只会拿到缓存里的空 linkCode 而进入绑定页。
+				ProtoOutput(MsgPairError, map[string]any{"error": err.Error()})
 				return
 			}
 			log.Infof("Client is ready")
@@ -466,6 +480,12 @@ func handleCmd(cmd string, args []string) {
 		linkingCode, err := cli.PairPhone(ctx, args[0], true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if err != nil {
 			ProtoOutput(MsgPairError, map[string]any{"error": err.Error()})
+			return
+		}
+		if linkingCode == "" {
+			// 兜底：即使 PairPhone 返回空 code，也不下发空串，按 pairError 处理
+			log.Errorf("PairPhone returned empty linking code")
+			ProtoOutput(MsgPairError, map[string]any{"error": "empty linking code"})
 			return
 		}
 		ProtoOutput(MsgLinkingCode, map[string]any{"code": linkingCode})
@@ -618,27 +638,80 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: subscribepresence <jid>")
 			return
 		}
-		if err := presenceMgr.Subscribe(args[0]); err != nil {
-			log.Errorf("Failed to subscribe presence for %s: %v", args[0], err)
-		} else {
-			// 重新订阅 = 取消退订标记（删除后重新添加的 observer 恢复事件处理）
-			presenceMgr.ClearUnsubscribed(args[0])
+		jidStr := args[0]
+		// 重新添加 observer（该 JID 仍带退订标记）：
+		// 软退订未移除服务器侧订阅，直接重订会被服务器视为「已订阅」的冗余请求、不重推
+		// 当前 presence，新 observer 的 onlineState 卡在 isReading。先协议退订再订阅，
+		// 强制服务器把本次订阅当作全新订阅处理并重推当前状态。
+		wasReAdd := presenceMgr.IsUnsubscribed(jidStr)
+		if wasReAdd {
+			if jid, ok := parseJID(jidStr); ok {
+				if err := cli.UnsubscribePresence(ctx, jid); err != nil {
+					log.Warnf("Failed to protocol-unsubscribe before re-subscribe for %s: %v", jidStr, err)
+				} else {
+					log.Infof("Protocol-unsubscribed %s before re-subscribe", jidStr)
+				}
+			}
+		}
+		if err := presenceMgr.Subscribe(jidStr); err != nil {
+			// 粘性订阅已记录 JID，本次仅发送失败（多为断线窗口）：不阻断后续逻辑，
+			// 重连后 ResubscribeAll 会补发。真正不可恢复的失败由 5s 兜底重连处理。
+			log.Warnf("Failed to send subscribe presence for %s: %v (will be retried on reconnect)", jidStr, err)
+		}
+		// 重新订阅 = 取消退订标记（删除后重新添加的 observer 恢复事件处理）。
+		// 即使本次 send 失败也清除标记：JID 已粘性入 subscribedJIDs，重连后
+		// ResubscribeAll 会补发，presence handler 也恢复对该 JID 事件的处理。
+		presenceMgr.ClearUnsubscribed(jidStr)
+		if wasReAdd {
+			// 标记为下次 ResubscribeAll 的优先重订阅对象：兜底重连后该 JID 的 fresh
+			// presence 最先到达，onlineState 尽快恢复（ResubscribeAll 的 map 遍历顺序
+			// 随机，不标记时重加 JID 可能被排到最后才重订，恢复被 N×300ms 拖慢）。
+			presenceMgr.MarkPriority(jidStr)
+			// 兜底：协议退订实测无效（服务器不响应停推→重推语义），presence 基本不会
+			// 在窗口内到达，重连是唯一可靠机制。等待窗口从 5s 压缩到 2s：既保留「若有
+			// presence 到达（巧合实时状态变更 / 未来服务器采纳协议退订）则跳过重连」的
+			// 自适应，又避免每次重加白白空等 5s。连接不在线（已登出/被顶号/进程退出中）
+			// 时跳过。
+			subscribedAt := time.Now()
+			go func() {
+				time.Sleep(2 * time.Second)
+				if !cli.IsConnected() {
+					return
+				}
+				if !presenceCache.HasFreshEvent(jidStr, subscribedAt) {
+					log.Warnf("No presence for re-added %s within 2s, forcing reconnect", jidStr)
+					cli.Disconnect()
+					if err := cli.Connect(); err != nil {
+						log.Errorf("Failed to reconnect for presence refresh: %v", err)
+					}
+				}
+			}()
 		}
 	case "unsubscribepresence":
-		// 软退订（whatsmeow 无协议级 UnsubscribePresence，服务器侧订阅到下次连接周期
-		// ResubscribeAll 不再重订时自动停止）：
-		//   1. 移出 subscribedJIDs —— 重连后不再重订；
-		//   2. 标记退订 —— presence handler 跳过该 JID，不再缓存/重放；
-		//   3. 清空 PresenceCache —— 抹掉已滞留的该 JID 事件。
+		// 删除/改号 observer 的退订，两层：
+		//   A. 协议级退订（新增）：向服务器发送 <presence type="unsubscribe">，停止该 JID 的
+		//      presence 推送。软退订无法移除服务器侧订阅，重加时 subscribe 会被视为冗余请求
+		//      而不重推当前状态（卡 isReading），协议退订从根上解决（见 subscribe 命令注释）。
+		//   B. 软退订（保留）：
+		//      1. 移出 subscribedJIDs —— 重连后不再重订；
+		//      2. 标记退订 —— presence handler 跳过该 JID，不再缓存/重放；
+		//      3. 清空 PresenceCache —— 抹掉已滞留的该 JID 事件。
 		if len(args) < 1 {
 			log.Errorf("Usage: unsubscribepresence <jid>")
 			return
 		}
-		jid := args[0]
-		presenceMgr.Unsubscribe(jid)
-		presenceMgr.MarkUnsubscribed(jid)
-		presenceCache.Remove(jid)
-		log.Infof("Unsubscribed presence for %s", jid)
+		jidStr := args[0]
+		if jid, ok := parseJID(jidStr); ok {
+			if err := cli.UnsubscribePresence(ctx, jid); err != nil {
+				log.Warnf("Failed to protocol-unsubscribe presence for %s: %v", jidStr, err)
+			} else {
+				log.Infof("Protocol-unsubscribed presence for %s", jidStr)
+			}
+		}
+		presenceMgr.Unsubscribe(jidStr)
+		presenceMgr.MarkUnsubscribed(jidStr)
+		presenceCache.Remove(jidStr)
+		log.Infof("Soft-unsubscribed presence for %s", jidStr)
 	case "presence":
 		if len(args) == 0 {
 			log.Errorf("Usage: presence <available/unavailable>")
@@ -1395,6 +1468,19 @@ func handler(rawEvt interface{}) {
 		}
 		// Re-subscribe all tracked contacts after reconnect (subscriptions are lost on disconnect)
 		go presenceMgr.ResubscribeAll()
+	case *events.Disconnected:
+		// 登录阶段（未完成 WhatsApp 关联）websocket 被服务器关闭 = 配对码已过期。
+		// whatsmeow pair-code.go：二维码耗尽后登录 websocket 会被 WhatsApp 关闭，约 160 秒时限；
+		// 此时 cli.Store.ID==nil → autoReconnect（client.go:618）直接 return，进程保持断开。
+		// 若不通知 Java，App 要等 Server 5 分钟 emitter 超时才收到 loginTimeout（不准）。
+		// 复用 pairError → Java ProcessUtils pairError 分支 → loginTimeout("pair error")
+		// → App 立即显示「配对码已过期，重新发送」。登录成功后 isLoggedIn=true，
+		// 运行期重连产生的 Disconnected 不命中此分支，无副作用。
+		// QR 流程不受影响：qrchan.go 在 QR 码耗尽时走 cli.Disconnect()（预期断开），不派发此事件。
+		if !cli.IsLoggedIn() {
+			log.Warnf("Disconnected during login phase (pairing code expired ~160s), notifying Java via pairError")
+			ProtoOutput(MsgPairError, map[string]any{"error": "pairing code expired (login websocket closed)"})
+		}
 	case *events.PushNameSetting:
 		// Pushname changed mid-session: re-send presence to update server,
 		// notify Java of new nickname. Not a login event.
