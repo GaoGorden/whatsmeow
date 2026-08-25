@@ -25,6 +25,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -309,7 +310,13 @@ func main() {
 			args := strings.Fields(cmd)
 			cmd = args[0]
 			args = args[1:]
-			go handleCmd(strings.ToLower(cmd), args)
+			cmd = strings.ToLower(cmd)
+			if cmd == "debug" {
+				// 调试命令：异步执行 + 输出捕获 + 超时兜底（不阻塞命令循环）
+				handleDebug(args)
+			} else {
+				go handleCmd(cmd, args)
+			}
 		}
 	}
 }
@@ -619,6 +626,38 @@ func handleCmd(cmd string, args []string) {
 				}
 			}
 		}
+	case "querypresence":
+		// 输出当前每 JID 的订阅状态 + presence 新鲜度快照，供 Web 管理后台判断监听有效性。
+		// 合并两个来源：subscribedJIDs（订阅是否建立，来自 PresenceManager）+ latest/lastArrival
+		// （最新状态与实时事件到达时刻，来自 PresenceCache）。jid 均为完整 JID 字符串。
+		subscribed := presenceMgr.Snapshot()
+		cacheSnap := presenceCache.Snapshot()
+		items := make([]map[string]any, 0, len(subscribed)+len(cacheSnap))
+		seen := make(map[string]bool, len(subscribed)+len(cacheSnap))
+		for jid := range subscribed {
+			item := map[string]any{"jid": jid, "subscribed": true}
+			if ev, ok := cacheSnap[jid]; ok {
+				for k, v := range ev {
+					item[k] = v
+				}
+			}
+			items = append(items, item)
+			seen[jid] = true
+		}
+		for jid, ev := range cacheSnap {
+			if seen[jid] {
+				continue
+			}
+			item := map[string]any{"jid": jid, "subscribed": false}
+			for k, v := range ev {
+				item[k] = v
+			}
+			items = append(items, item)
+		}
+		ProtoOutput(MsgPresenceStatus, map[string]any{
+			"count": len(items),
+			"items": items,
+		})
 	//case "checkupdate":
 	//	resp, err := cli.CheckUpdate()
 	//	if err != nil {
@@ -1846,4 +1885,120 @@ func requestPresignedPut(objectKey string) (string, error) {
 		return "", fmt.Errorf("presign response missing url: %s", string(body))
 	}
 	return parsed.URL, nil
+}
+
+// lockedWriter is a goroutine-safe io.Writer that appends into a shared buffer.
+// The pipe reader goroutine in handleDebug copies os.Stdout output into it; a mutex
+// protects the buffer against concurrent writes from background goroutine logs.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// handleDebug runs a whatsmeow debug command and captures its stdout output into a
+// debugResult proto message for the Web console. In daemon mode Go stdout is
+// redirected to go.log (Java only reads the Unix socket), so the captured output is
+// the only way Java can relay it. ProtoOutput itself is unaffected: it writes to the
+// socket backend, not os.Stdout.
+//
+// Capturing uses os.Pipe(): os.Stdout is typed *os.File, so it cannot be assigned an
+// arbitrary io.Writer — we swap in the pipe's write end and copy the read end into a
+// buffer. fmt.Printf and waLog.Stdout both funnel through fmt.Printf which re-reads
+// os.Stdout per call, so both are captured.
+//
+// Runs the sub-command asynchronously with a 20s timeout: a hung cli call neither
+// blocks the command loop nor leaves os.Stdout swapped forever (on timeout the
+// goroutine keeps running but its later output goes to the restored real stdout).
+func handleDebug(args []string) {
+	if len(args) == 0 {
+		ProtoOutput(MsgDebugResult, map[string]any{
+			"usage":  "debug <cmd> [args...]",
+			"output": "",
+		})
+		return
+	}
+	cmd := strings.ToLower(args[0])
+	cmdArgs := args[1:]
+	start := time.Now()
+
+	var mu sync.Mutex
+	var buf bytes.Buffer
+
+	oldStdout := os.Stdout
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		ProtoOutput(MsgDebugResult, map[string]any{
+			"cmd":    cmd,
+			"args":   cmdArgs,
+			"output": "[debug: os.Pipe failed: " + err.Error() + "]",
+			"ms":     0,
+		})
+		return
+	}
+	os.Stdout = pw
+
+	// 读端 goroutine：持续把管道内容写入缓冲（防止管道写满阻塞命令执行）
+	copyDone := make(chan struct{})
+	go func() {
+		defer close(copyDone)
+		_, _ = io.Copy(lockedWriter{mu: &mu, w: &buf}, pr)
+	}()
+
+	cmdDone := make(chan struct{})
+	var protoBuf bytes.Buffer
+	setDebugCapture(&protoBuf) // 捕获命令期间经 ProtoOutput 输出的 proto（如 checkUser 结果）
+	go func() {
+		defer close(cmdDone)
+		handleCmd(cmd, cmdArgs)
+	}()
+
+	timedOut := false
+	select {
+	case <-cmdDone:
+	case <-time.After(20 * time.Second):
+		timedOut = true
+	}
+
+	// 恢复 stdout（之后子命令/后台 goroutine 的输出回到真实 stdout / go.log）
+	os.Stdout = oldStdout
+	_ = pw.Close() // 关闭写端 → 读端 io.Copy 收到 EOF
+	setDebugCapture(nil) // 停止 proto 捕获（此后 debugResult 自身与后台事件不再进缓冲）
+
+	if timedOut {
+		mu.Lock()
+		buf.WriteString("\n[debug: command did not finish in 20s, output may be partial]\n")
+		mu.Unlock()
+		// 尽力等读端把管道残留拷进缓冲（命令可能仍在运行，不无限等待）
+		select {
+		case <-copyDone:
+		case <-time.After(200 * time.Millisecond):
+		}
+	} else {
+		<-copyDone // 命令已完成：等读端复制完，保证 output 完整
+	}
+
+	mu.Lock()
+	out := buf.String()
+	mu.Unlock()
+	// 追加命令期间捕获的 proto 消息（如 checkUser 的查询结果，不经过 stdout）
+	if protoBuf.Len() > 0 {
+		out += "\n--- proto（命令期间 Go→Java 协议消息） ---\n" + protoBuf.String()
+	}
+	const maxDebugOutput = 100 * 1024
+	if len(out) > maxDebugOutput {
+		out = out[len(out)-maxDebugOutput:] + "\n[output truncated to last 100KB]\n"
+	}
+
+	ProtoOutput(MsgDebugResult, map[string]any{
+		"cmd":    cmd,
+		"args":   cmdArgs,
+		"output": out,
+		"ms":     time.Since(start).Milliseconds(),
+	})
 }

@@ -163,3 +163,15 @@ func (pm *PresenceManager) JIDs() []string {
 	return result
 }
 
+// Snapshot returns a copy of the currently-subscribed JID set (key: full JID).
+// 供 querypresence 命令汇总输出，Java 端据此判断各 observer 的订阅是否建立。
+func (pm *PresenceManager) Snapshot() map[string]bool {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	result := make(map[string]bool, len(pm.subscribedJIDs))
+	for jid := range pm.subscribedJIDs {
+		result[jid] = true
+	}
+	return result
+}
+

@@ -192,3 +192,26 @@ func emitPresence(pe *presenceEvent) {
 	}
 	ProtoOutput(MsgPresence, data)
 }
+
+// Snapshot 返回每 JID 的最新 presence 状态 + 实时事件到达时刻（wall clock），
+// 供 querypresence 命令汇总输出。key 为完整 JID 字符串（同 latest 的 key）。
+// lastArrival 用 UnixMilli（绝对时刻，不受时区影响），Java 端可换算成"多久前收到"。
+func (pc *PresenceCache) Snapshot() map[string]map[string]any {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+	result := make(map[string]map[string]any, len(pc.latest))
+	for jid, ev := range pc.latest {
+		item := map[string]any{
+			"state": ev.state,
+			"ts":    ev.ts,
+		}
+		if ev.lastSeen != "" {
+			item["lastSeen"] = ev.lastSeen
+		}
+		if t, ok := pc.lastArrival[jid]; ok {
+			item["lastArrivalMs"] = t.UnixMilli()
+		}
+		result[jid] = item
+	}
+	return result
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -36,6 +37,8 @@ const (
 	MsgResubscribe    = "resubscribe"    // Result of auto-resubscribe after reconnect
 	MsgStreamReplaced = "streamReplaced" // Session taken over by another device
 	MsgLoggedOut      = "loggedOut"      // Logged out event from WhatsApp server
+	MsgPresenceStatus = "presenceStatus" // 每 JID 订阅状态 + presence 新鲜度快照（querypresence 命令响应）
+	MsgDebugResult     = "debugResult"     // 通用调试命令输出快照（debug 命令响应）
 )
 
 // protoBackend abstracts where ProtoOutput writes protocol messages.
@@ -125,6 +128,22 @@ func setDaemonBackend() {
 	activeBackend = globalSocketBackend
 }
 
+// debug 命令运行期间的 proto 捕获缓冲（Web 调试控制台用）。
+// 部分命令（如 checkuser）的结果经 ProtoOutput 走 socket 返回、不经过 stdout；
+// 调试期间把这些 proto 消息复制一份，随 debugResult 一并回显。单进程同时只有一个
+// debug 命令（Server 端按用户串行），故用简单包级缓冲 + mutex 即可。
+var (
+	debugCaptureMu  sync.Mutex
+	debugCaptureBuf *bytes.Buffer
+)
+
+// setDebugCapture 开启/关闭调试期 proto 捕获（nil 表示关闭）。
+func setDebugCapture(buf *bytes.Buffer) {
+	debugCaptureMu.Lock()
+	debugCaptureBuf = buf
+	debugCaptureMu.Unlock()
+}
+
 // ProtoOutput writes a structured JSON protocol message.
 // Each message is a single line: ##PROTO##{"type":"...","field":"value",...}
 // The output is atomic (single write call) to prevent interleaving with log output.
@@ -136,5 +155,12 @@ func ProtoOutput(msgType string, data map[string]any) {
 		fmt.Printf("ProtoOutput marshal error for type %s: %v\n", msgType, err)
 		return
 	}
-	activeBackend.write(PROTO_PREFIX + string(b) + "\n")
+	line := PROTO_PREFIX + string(b) + "\n"
+	activeBackend.write(line)
+	// debug 命令运行期间：把 proto 消息也复制进调试捕获缓冲（如 checkUser 结果，Web 调试控制台回显用）
+	debugCaptureMu.Lock()
+	if debugCaptureBuf != nil {
+		debugCaptureBuf.WriteString(line)
+	}
+	debugCaptureMu.Unlock()
 }
