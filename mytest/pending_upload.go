@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -66,6 +67,8 @@ func savePendingUpload(observerId, pushName, fileName string, fileData []byte, f
 		return err
 	}
 	prunePendingUploads()
+	// 暂存是整份 []byte 落盘，为省内存再落盘一份明文拷贝的峰值残留，归还给 OS
+	debug.FreeOSMemory()
 	return nil
 }
 
@@ -137,6 +140,8 @@ func flushPendingUploads() {
 		_ = os.Remove(p.json)
 		_ = os.Remove(p.bin)
 		log.Infof("pending-upload %s replayed to Java (objectKey %s)", p.base, objectKey)
+		// 重传成功，归还暂存 ReadFile 峰值扩出的 arena 给 OS
+		debug.FreeOSMemory()
 	}
 }
 

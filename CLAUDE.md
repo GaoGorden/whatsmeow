@@ -91,6 +91,7 @@ cli = whatsmeow.NewClient(device, log)
    - **上传方式（方案B）**：Go 不再内嵌 AWS SDK，而是 `GET {server-url}/inner/presignViewOnceUpload?objectKey=...` 向 Java Server 申请 S3 预签名 PUT URL，再直接 HTTP PUT 上传。`--server-url` 由 Java 启动时传入。详见 `doc/Go进程内存优化与预签名上传方案.md`
    - **完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，Java 重连后 `flushPendingUploads` 补传 + `presenceCache.Notify` 补通知（`pending_upload.go`）
    - **内存优化（方案A）**：`main()` 开头 `debug.SetMemoryLimit(64<<20)` 设堆软上限，防 view-once 下载/历史同步瞬时大分配打穿节点
+   - **内存优化（方案B，2026-08-26）**：`cli.Download()` 双缓冲（`io.ReadAll` 密文 + `cbcutil.Decrypt` 明文）会把 Go heap arena 撑到峰值，但 GC 后 Go **不归还**扩大的 arena 给 OS（GOMEMLIMIT 是软上限、不触发去提交），形成「当前 RSS 35-43MB / live heap 仅 1-11MB」的峰值残留。在 `uploadAndNotify`（直接上传成功）、`savePendingUpload`（暂存落盘后）、`flushPendingUploads`（每个重传成功项）三处各加 `debug.FreeOSMemory()` 强制归还。详见 `doc/linux_go内存优化方案_viewonce流式与FreeOSMemory.md`
 
 **S3 上传路径**：`whatsapp/view-once/{userJID}/{messageID}{extension}`
 
@@ -174,6 +175,7 @@ Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一
 | `disable-view-once` | 关闭 ViewOnce 拦截 |
 | `pair-phone <number>` | 验证码登录 |
 | `require-qrcode` | QR 码登录 |
+| `set-logintype <type> [deviceName]` | 设置登录类型（`waTracker_android`/`wastgo_win`，须在配对命令前发送）。可选第 2 参数 = 按马甲包指定的设备显示名（Server 按 packageName 解析：weseen→"WeSeen"、assist→"WaTracker"）；缺省 `waTracker_android` 回落 "WeSeen"、`wastgo_win` 恒 "WastGo"。仅对新配对生效（DeviceProps.Os 在配对注册时上报） |
 | `reconnect` | 断开并重连 |
 | `logout` | 登出 |
 | `subscribepresence <jid>` | 订阅联系人在线状态（粘性订阅：即使断线发送失败也记录 JID，重连后 `ResubscribeAll` 补发；发送失败不再阻断，`ClearUnsubscribed` 始终执行）。**重加 JID（仍带退订标记）先协议退订（实测无效，best-effort）再订阅**；2s 内无推送则强制重连兜底（重连为唯一可靠重推机制） |

@@ -444,12 +444,18 @@ func handleCmd(cmd string, args []string) {
 	// already-paired devices retain their name server-side and are unaffected.
 	case "set-logintype":
 		if len(args) < 1 {
-			log.Errorf("Usage: set-logintype <waTracker_android|wastgo_win>")
+			log.Errorf("Usage: set-logintype <waTracker_android|wastgo_win> [deviceName]")
 			return
 		}
 		switch args[0] {
 		case "waTracker_android":
-			store.DeviceProps.Os = proto.String("WeSeen")
+			// 可选第 2 参数 = 按马甲包指定的设备显示名（Java Server 按 packageName 解析后下发）；
+			// 缺省回落 "WeSeen"（weseen 默认 / 旧客户端不传 packageName 的兜底）。
+			if len(args) >= 2 {
+				store.DeviceProps.Os = proto.String(args[1])
+			} else {
+				store.DeviceProps.Os = proto.String("WeSeen")
+			}
 		case "wastgo_win":
 			store.DeviceProps.Os = proto.String("WastGo")
 		default:
@@ -1822,6 +1828,10 @@ func uploadAndNotify(observerId string, pushName string, fileName string, fileDa
 		"seconds":    seconds,
 		"objectKey":  objectKey,
 	})
+
+	// 上传完成：cli.Download 双缓冲（密文+明文）把 Go arena 撑到峰值，GC 后不归还 OS，
+	// 强制返还给系统，消除「当前 RSS 35-43MB / live heap 1-11MB」的峰值残留
+	debug.FreeOSMemory()
 
 	return nil
 }
