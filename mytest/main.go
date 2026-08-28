@@ -230,9 +230,13 @@ func main() {
 		for range ticker.C {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
+			rss, pss, shared := readProcMem()
 			ProtoOutput(MsgHeartbeat, map[string]any{
 				"goroutines":  runtime.NumGoroutine(),
 				"mem_mb":      m.Alloc / 1024 / 1024,
+				"rss_mb":      rss,
+				"pss_mb":      pss,
+				"shared_mb":   shared,
 				"subscribers": presenceMgr.Count(),
 				"uptime_sec":  time.Since(time.Unix(startupTime, 0)).Seconds(),
 			})
