@@ -29,7 +29,10 @@
 | `daemon_other.go` | 非 Linux daemon 化 no-op（Windows 联调用） |
 | `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅；含退订标记集 `unsubscribedJIDs`，软退订 + 协议退订（`UnsubscribePresence`，**实测无效**，best-effort）双层；`Subscribe` 为**粘性订阅**——断线发送失败也记录 JID，重连后 `ResubscribeAll` 补发；`MarkPriority` **优先重订阅**重加 JID（ResubscribeAll 先发它，避免 map 随机顺序把重加 JID 排到最后拖慢恢复）；重加 observer 靠 2s 无推送强制重连兜底） |
 | `presence_cache.go` | **Presence 事件缓存与重放**：Java 掉线期间缓存上下线通知，重连后按序重放（含 `ts` 时间戳精确还原）；`Notify` 同时缓冲 view-once 等运行时通知；`Remove(jid)` 清空单 JID 缓存（软退订用）；`lastArrival`/`HasFreshEvent` 供重加订阅后 2s 无推送判定（触发强制重连兜底）。详见 `doc/Go端presence事件缓存与重放方案.md`、`doc/Server重启窗口Observer操作与presence重放风险修复.md` |
-| `pending_upload.go` | **View-once 完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，attach/周期触发重传 + 补通知，上限 100 条。详见 `doc/Go进程内存优化与预签名上传方案.md`「完整恢复」 |
+| `status.go` | **Status（动态）采集主体**（2026-09-22 新增）：`handleStatusMessage` = 过滤链（总开关 / `IsFromMe` / 纯 SKDM / `ProtocolMessage`(REVOKE) / 号码过滤集 / LRU 去重）→ 类型分派（image/video/audio 走下载上传，text 直发）→ worker 池（并发 2）→ outbox。含 `statusObserverSet`（全量覆盖 `replace`）、`statusSeenSet`（5000 条环形去重）、`normalizeStatusJid`、`statusObjectKey`、磁盘水位暂停。详见 `doc/Status动态追踪_Go端实施记录.md`、方案 `doc/Status动态追踪功能实现方案.md` |
+| `diskfree_linux.go` / `diskfree_other.go` | `statusFreeDiskBytes(path)` 平台分叉（`syscall.Statfs`）。**非 Linux 返回 `ok=false`** → 磁盘水位保护只在生产生效，本地 Windows 联调不会被暂停逻辑卡住（对照 `proc_mem_linux.go` / `proc_mem_other.go`） |
+| `status_test.go` | Status 单测 9 个（过滤链早退、去重集淘汰、outbox 生命周期/裁剪、payload 字段表）。`statusMaxFileBytes` / `statusOutboxMax` 写成 `var` 就是为了单测能调小 |
+| `pending_upload.go` | **View-once 完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，attach/周期触发重传 + 补通知，上限 **100 条 + 2GiB**（双上限，任一超标按 mtime 丢最旧）。**2026-09-22 流式改造**：下载走 `downloadToTemp`（`cli.DownloadToFile` 落临时文件）、上传走 `uploadFileToS3`、暂存走 `moveFile`（rename 优先），全链路内存 O(32KB) 与文件大小无关。详见 `doc/pending-upload流式改造实施记录.md`、`doc/Go进程内存优化与预签名上传方案.md`「完整恢复」。**同批新增 `Source` 判别字段**：`flushPendingUploads` 按 `meta.Source == "status"` 分流到 `flushPendingStatus`——Status 复用这套暂存目录，就同时复用了条数/字节双上限、rename 搬移与 attach/周期两条重传触发路径；`Source` 为空（含历史遗留记录）走原 view-once 路径。`flushPendingStatus` 用记录里**存下的 `ObjectKey`**（不重新推导，否则重传会落到与 DB 不同的键上） |
 | `main_new.go` | 原始上游示例代码（函数名改为 `maingg()`，不执行） |
 | `go.mod` | 独立 Go module，通过 `replace` 指向本地 whatsmeow 库 |
 | `amazon.yaml` | ⚠️ **已废弃**：原 S3 凭证嵌入文件，方案B 后 Go 不再嵌入/引用（可删除，密钥改由 Server 侧 S3Config 统一持有） |
@@ -86,12 +89,13 @@ cli = whatsmeow.NewClient(device, log)
 1. 检测 `evt.Message.GetImageMessage().GetViewOnce()` / `GetVideoMessage()` / `GetAudioMessage()`
 2. 通过 `searchPhoneNum()` 将 LID 解析为真实电话号码
 3. 通过 `getNickName()` 获取联系人昵称（优先 FullName → PushName）
-4. 异步调用 `cli.Download()` 下载媒体
-5. `uploadAndNotify()` 上传到 S3 并输出 JSON 通知（`ProtoOutput(MsgViewOnceFile)`，Java Server 通过 socket/Proto 协议解析）
+4. 异步调用 `downloadToTemp()` 把媒体**流式下载**到 `media-tmp/{msgID}.bin`（内部用 `cli.DownloadToFile`）
+5. `uploadAndNotify()` 上传到 S3 并输出 JSON 通知（`ProtoOutput(MsgViewOnceFile)`，Java Server 通过 socket/Proto 协议解析），返回前删除临时文件
    - **上传方式（方案B）**：Go 不再内嵌 AWS SDK，而是 `GET {server-url}/inner/presignViewOnceUpload?objectKey=...` 向 Java Server 申请 S3 预签名 PUT URL，再直接 HTTP PUT 上传。`--server-url` 由 Java 启动时传入。详见 `doc/Go进程内存优化与预签名上传方案.md`
    - **完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，Java 重连后 `flushPendingUploads` 补传 + `presenceCache.Notify` 补通知（`pending_upload.go`）
    - **内存优化（方案A）**：`main()` 开头 `debug.SetMemoryLimit(64<<20)` 设堆软上限，防 view-once 下载/历史同步瞬时大分配打穿节点
    - **内存优化（方案B，2026-08-26）**：`cli.Download()` 双缓冲（`io.ReadAll` 密文 + `cbcutil.Decrypt` 明文）会把 Go heap arena 撑到峰值，但 GC 后 Go **不归还**扩大的 arena 给 OS（GOMEMLIMIT 是软上限、不触发去提交），形成「当前 RSS 35-43MB / live heap 仅 1-11MB」的峰值残留。在 `uploadAndNotify`（直接上传成功）、`savePendingUpload`（暂存落盘后）、`flushPendingUploads`（每个重传成功项）三处各加 `debug.FreeOSMemory()` 强制归还。详见 `doc/linux_go内存优化方案_viewonce流式与FreeOSMemory.md`
+   - **流式改造（2026-09-22）**：上一条的**根因已消除**——改用 `cli.DownloadToFile` + 32KB 分块原地解密（`cbcutil.DecryptFile`）+ `io.Reader` 上传 + `rename` 搬移暂存后，**没有任何路径按文件大小分配内存**，全链路 O(32KB)。三处 `FreeOSMemory()` 随之移除（`uploadAndNotify` 保留一处作廉价兜底）。**单条媒体大小自此不再影响堆占用**，这是 Status 可放开单条上限的前提。`pending-upload` 同时补上 2GiB 字节上限，并新增 `media-tmp` 孤儿回收（`cleanMediaTmp`，1 小时阈值）。详见 `doc/pending-upload流式改造实施记录.md`
 
 **S3 上传路径**：`whatsapp/view-once/{userJID}/{messageID}{extension}`
 
@@ -187,6 +191,70 @@ Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一
 | `getuser <jids...>` | 获取用户信息 |
 | `presence <available/unavailable>` | 设置自身在线状态 |
 | `setpushname <name>` | 设置推送昵称 |
+| `enable-status-track` | 开启 Status（动态）采集总开关（`statusTrackEnabled`）。由 Server 在 `loginSuccess→checkObservers` / re-attach 时按 `sub_user.enable_status_track` 下发 |
+| `disable-status-track` | 关闭总开关。**只停止采集，不清理已收数据**——套餐有效期内数据保留 |
+| `syncstatusobservers <jid...>` | **全量覆盖** Status 过滤集合（`statusObservers.replace`，**空集合 = 清空**）。Java 侧刻意只提供全量、不做增量：增量漏一次会静默地让集合与服务器侧不一致（表现为「某些联系人永远收不到动态」且不报错） |
+| `addstatusobserver <jid>` / `removestatusobserver <jid>` | 增/删单个成员。**Java 侧无调用点**，留作 Web 调试控制台的调试命令；业务路径一律走 `syncstatusobservers` 全量覆盖 |
+| `statusack <statusId>` | Server 确认某条 Status 已终态落库（或被唯一键判为重复 / 毒报文 / 刻意丢弃）→ Go 删除对应 `status-outbox/{statusId}.json`。**不 ack 的场景只有 `subUser == null`**（用户释放路径上的瞬态，宁重勿丢） |
+
+### 6. Status（动态）采集
+
+> 方案见 `doc/Status动态追踪功能实现方案.md` §3，实施记录见 `doc/Status动态追踪_Go端实施记录.md`，
+> 可行性实测见 `doc/State Track动态追踪可行性验证记录.md`。入口 `status.go`。
+
+**与 ViewOnce / Presence 的三个本质区别**：
+
+1. **不需要订阅协议**：Status 发往 `status@broadcast`，服务器会推给**所有联系人**。
+   Go 侧只维护一个「哪些号码的动态要留」的**过滤集合**（`statusObservers`），不做任何 subscribe。
+2. **过滤按电话号码**（不是 JID 字符串比对）：比对前统一走 `normalizeStatusJid` 归一化
+   （剥 `+` 前缀、去设备号后缀、补 `@s.whatsapp.net`）。**这一步不做就会静默失配**——
+   表现为「某些联系人永远收不到动态」，且没有任何报错。
+3. **纯文字动态也要保存文案**（产品要求）：`kind=text` 走**完全独立的一条早退路径**——
+   没有文件就 `publishStatus` 直接上报，**不碰**下载 / S3 / worker 池 / 队列背压那一整套。
+   这是实现时最容易漏的地方（拿一个空 media message 去下载）。
+
+**事件分支必须最先 return**（`main.go` 的 `events.Message`）：动态是发往 `status@broadcast` 的**普通消息**，
+若不拦在通用逻辑之前，会被当成「收到一条消息」上报 Java → observer 误标 `ONLINE` + 写脏 `History`。
+这是可行性验证记录 §3.3 记的**存量问题**（与 Status 功能无关），本次一并修掉，
+连带 `skdm-only` / `REVOKE` / 自己发的动态也不再污染 observer 状态。
+
+**过滤链（全部发生在下载之前）**：总开关 → `evt.Info.IsFromMe` → 纯 SKDM（
+`GetSenderKeyDistributionMessage() != nil` 且 `!statusHasContent`，新 sender key 首条的重复派发）
+→ `GetProtocolMessage() != nil`（REVOKE 不处理，对齐竞品）→ 过滤集合 → LRU 去重。
+
+**两条可靠性机制（互不替代，覆盖不同断线场景）**：
+
+| 机制 | 兜的场景 | 载体 | 删除时机 |
+|---|---|---|---|
+| `presenceCache.Notify`（既有，Status 复用） | Java 掉线 | 内存 FIFO | 进程存活期内 |
+| `status-outbox/{statusId}.json`（**新增**） | Go 进程重启、两者都重启 | 磁盘 | 收到 `statusack` |
+| `pending-upload/`（复用，`Source=status`） | 连 S3 都没传上去 | 磁盘（媒体本体） | 重传成功 |
+
+outbox 的三个触发点：① 写入在 `publishStatus` 里**先落盘再 Notify**；② 重放在 attach 时 +
+每 60s（且 `HasJavaClient()` 为真，否则会把记录灌进内存缓冲白占容量）；③ 删除**只由 ack 触发**
+（重放不删——否则 Java 落库失败就永久丢了）。两条防呆：**重放间隔抑制 5 分钟**（兜「Server 是旧版、
+永不 ack」，否则每 60s 会把最多 5000 条全量重发）+ **毒记录直接删**（JSON 反序列化失败，重放多少次都一样）。
+
+⚠️ **部署顺序 Server 先于 Go**：新 Go 配旧 Server 时 outbox 收不到 ack，会涨到 5000 上限后开始丢最旧。
+计划顺序（Server → Proxy → Go → App）天然满足。
+
+**并发与背压**（方案 §3.7）：worker 数即信号量（并发 **2**，`startStatusWorkers`）；队列 64 条，
+队满**丢最旧** + `log.Errorf` + `statusDropped.Add(1)`；下载/上传各 120s 超时（view-once 仍 60s，
+故 `uploadFileToS3`/`uploadStreamToS3` 新增了 `timeout` 参数）；单条 **100MB** 上限
+（`statusMaxFileBytes`，超出只报元数据 + 缩略图，**不下载媒体**）。
+
+**磁盘水位**：剩余 < 200MB 时暂停下载（`statusWaitForDisk`），超过 5 分钟仍不足则降级为
+「只上报元数据 + 缩略图」——避免一个饿死的 worker 长期占住并发位。为什么是「暂停」而不是「丢弃」：
+动态媒体 24h 后就再也拿不到了，丢一条就是永久缺失；暂停的代价是队列积压并触发背压丢弃，那是设计内行为。
+非 Linux 上 `statusFreeDiskBytes` 返回 `ok=false` → 水位保护直接放行（本地调试不会被卡）。
+
+**缩略图**：由 **Go 上传**（Server 的 `thumbKey` 直接取自 Go 上报，不自己生成），且**先于媒体上传**——
+这样即使媒体上传失败，列表页仍能渲染。代价是「媒体上传失败 → 进 pending-upload → 该条最终被裁剪」
+时会留下一个 1~4KB 的孤儿缩略图，**接受该取舍**（详见实施记录 §9）。
+
+**对象键**：`whatsapp/status/{userJID}/{observerJid}/{statusId}{ext}`，**前缀必须是 `whatsapp/status/`**，
+否则 Server 的 `/inner/presignStatusUpload` 直接 400（对照 ViewOnce 的 `whatsapp/view-once/`）。
+扩展名走显式 mime→ext 表 `statusMediaExt`（**不用 `mimetype` 库**），以保证首次上传与重传算出**同一个键**。
 
 ## 库层目录结构（上游 + 定制）
 
@@ -294,6 +362,7 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 | `MsgViewOnceFile` | `viewOnceFile` | 阅后即焚文件通知 |
 | `MsgViewOnceEnabled` | `viewOnceEnabled` | ViewOnce 开关确认 |
 | `MsgPairError` | `pairError` | 配对错误 |
+| `MsgStatusFile` | `statusFile` | **Status（动态）条目上报**（2026-09-22 新增）：`statusId` / `observerId` / `pushName` / `kind`(text·image·video·audio) / `miniType` / `fileLength` / `seconds` / `text`（文案，产品要求保存）/ `objectKey` / `thumbKey` / `postedAt`。⚠️ **必须走 `PresenceCache.Notify`，不得裸 `ProtoOutput`**——裸输出拿不到掉线缓冲，Java 掉线期间会直接丢。⚠️ `kind` 为媒体但 `objectKey` 为空 = 该条媒体不可用（超 100MB 只报元数据，或磁盘水位降级），App 侧据此渲染 |
 | `MsgHeartbeat` | `heartbeat` | 进程心跳（60s 间隔） |
 | `MsgResubscribe` | `resubscribe` | 重连后重订阅结果 |
 | `MsgStreamReplaced` | `streamReplaced` | 被顶号（其他设备登录） |
@@ -303,7 +372,8 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 - **连接用途标记协议**（`startCommandSocket` accept 循环）：首行发 `attach` 的连接才 `setProtoConn + Replay + flushPendingUploads`；命令/探测连接（sendCommand、health checker probe）只喂命令、不设后端、不重放——避免非 attach 连接提前消耗 PresenceCache 缓冲导致事件写进无人读取的 socket 而丢失。⚠️ **部署顺序：Java 先于 Go**（旧 Java + 新 Go 断裂）。见 `doc/Server重启窗口Observer操作与presence重放风险修复.md`
 - **PresenceManager**（`presence_manager.go`）：跟踪所有已订阅的联系人 JID，`events.Connected` 时自动调用 `ResubscribeAll()` 重订阅；含退订标记集（`MarkUnsubscribed/ClearUnsubscribed/IsUnsubscribed`），软退订时 presence handler 跳过该 JID；`Subscribe` 为**粘性订阅**（断线发送失败也记录 JID，重连后 `ResubscribeAll` 补发，替代 Java `loginSuccess→checkObservers` 补订）。重加 JID 流程：`UnsubscribePresence`（**实测无效**，best-effort）→ 订阅 → 2s 内无推送则强制重连兜底（**重连是唯一可靠机制**，重连后 `ResubscribeAll` 全量重订必然重推）
 - **PresenceCache**（`presence_cache.go`）：Java 掉线期间的事件重放缓存，覆盖两类事件——① presence（`Handle`）：先入缓冲，Java 在线立即排空、掉线留存，attach 后 `Replay()` 按序重放 + 溢出 JID latest 兜底，重放/实时均带 `ts` 还原历史时间；② 运行时通知（`Notify`，view-once 等）：纯 FIFO，`uploadAndNotify` 走 `Notify` 防 S3 孤儿，溢出记 ERROR；`Remove(jid)` 软退订时清空单 JID 滞留事件；`lastArrival`/`HasFreshEvent(jid,since)` 记录每 JID 最近实时事件到达时刻，供重加订阅后的新鲜度校验（2s 无推送 → 强制重连兜底，协议退订实测无效，重连是唯一可靠重推机制）
-- **心跳**：每 60 秒输出 `heartbeat`，上报 goroutine 数、内存使用、订阅数、运行时间。内存分四列：`mem_mb`=Go 堆(`runtime.MemStats.Alloc`)、`rss_mb`=物理驻留(含共享,跨进程重复计数)、`pss_mb`=真实物理(共享页均摊)、`shared_mb`=共享页占用。ps. 生产 Linux 读 `/proc/self/smaps_rollup`，Windows 无 `/proc` 时 rss/pss/shared 报 -1（Java/web 显示「—」）。详见 `doc/web页展示Whatsmeow进程真实内存占用方案.md`
+- **心跳**：每 60 秒输出 `heartbeat`，上报 goroutine 数、内存使用、订阅数、运行时间。内存分四列：`mem_mb`=Go 堆(`runtime.MemStats.Alloc`)、`rss_mb`=物理驻留(含共享,跨进程重复计数)、`pss_mb`=真实物理(共享页均摊)、`shared_mb`=共享页占用。ps. 生产 Linux 读 `/proc/self/smaps_rollup`，Windows 无 `/proc` 时 rss/pss/shared 报 -1（Java/web 显示「—」）。详见 `doc/web页展示Whatsmeow进程真实内存占用方案.md`。
+  **Status 指标**（2026-09-22 追加 5 项）：`status_enabled`(总开关)、`status_observers`(过滤集合大小)、`status_pending`(**outbox 待确认条数**)、`status_dropped`(**累计丢弃数**)、`status_queue`(待处理队列长度)。判读：`status_dropped > 0` = **有动态永久丢失，需告警**；`status_pending` 长期不降 = Server 没在 ack（多半是旧版 Server 未部署 `statusack`）
 - **StreamReplaced 处理**：发送 Proto 通知 → `cli.Disconnect()` → `time.Sleep(3s)` → `os.Exit(42)`
 - **LoggedOut 处理**：发送 Proto 通知 → `cli.Disconnect()` → `time.Sleep(3s)` → `os.Exit(43)`
 - **ViewOnce 超时保护**：下载 60 秒超时，上传 30 秒超时（`context.WithTimeout`）

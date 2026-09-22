@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"runtime/debug"
@@ -239,11 +240,20 @@ func main() {
 				"shared_mb":   shared,
 				"subscribers": presenceMgr.Count(),
 				"uptime_sec":  time.Since(time.Unix(startupTime, 0)).Seconds(),
+				// Status 采集的可观测指标（方案 §3.7 心跳指标）：
+				// pending = outbox 待 Java 确认条数（长期不降 = Java 没在 ack）；
+				// dropped = 队列背压 + outbox 溢出累计丢弃（>0 即代表有动态永久丢失）；
+				// queue   = 当前待处理队列长度。
+				"status_enabled":   statusTrackEnabled.Load(),
+				"status_observers": statusObservers.count(),
+				"status_pending":   statusOutboxCount(),
+				"status_dropped":   statusDropped.Load(),
+				"status_queue":     len(statusQueue),
 			})
 		}
 	}()
 
-	// 周期重试暂存的 view-once 媒体（attach 触发为主，周期兜底覆盖重传失败/延迟场景；
+	// 周期重试暂存的媒体 + 重放 Status outbox（attach 触发为主，周期兜底覆盖重传失败/延迟场景；
 	// 仅在有 Java 客户端时执行，预签名依赖 Server 在线）
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -251,9 +261,13 @@ func main() {
 		for range ticker.C {
 			if HasJavaClient() {
 				flushPendingUploads()
+				replayStatusOutbox()
 			}
 		}
 	}()
+
+	// Status（动态）采集 worker：并发上限即 worker 数（方案 §3.7 的信号量口径）
+	startStatusWorkers()
 
 	cli.AddEventHandler(handler)
 	if device.ID != nil {
@@ -367,6 +381,10 @@ func startCommandSocket(input chan<- string, sockPath string) {
 				setProtoConn(conn)
 				presenceCache.Replay()
 				go flushPendingUploads()
+				// outbox 必须等 Replay 之后再放：Replay 先排空 Java 掉线期间内存里缓冲的
+				// 通知，outbox 兜的是「进程重启」那部分（内存缓冲已丢）——顺序反了不会出错，
+				// 但会让日志看不出真实的重放量。
+				go replayStatusOutbox()
 				log.Infof("Java client attached from %s", conn.RemoteAddr())
 			} else if readErr == nil && len(first) > 0 {
 				log.Debugf("command-only connection: %s", first)
@@ -736,6 +754,40 @@ func handleCmd(cmd string, args []string) {
 				}
 			}()
 		}
+	case "enable-status-track":
+		statusTrackEnabled.Store(true)
+		log.Infof("Status track enabled")
+	case "disable-status-track":
+		// 只停采集，**不删已采集的数据**（套餐有效期内始终保留，只有宽限期到期才清）
+		statusTrackEnabled.Store(false)
+		log.Infof("Status track disabled")
+	case "syncstatusobservers":
+		// 全量覆盖（Java 侧唯一的同步方式）：空参数列表 = 清空集合，同样下发。
+		// 增量同步一旦漏一次就是**静默**不一致（「某些联系人永远收不到动态」，无任何报错），
+		// 故 Java 侧只提供全量覆盖，add/remove 仅作调试命令保留。
+		statusObservers.replace(args)
+		log.Infof("Status observers synced, count: %d", statusObservers.count())
+	case "addstatusobserver":
+		if len(args) < 1 {
+			log.Errorf("Usage: addstatusobserver <jid>")
+			return
+		}
+		statusObservers.add(normalizeStatusJid(args[0]))
+		log.Infof("Status observer added: %s (count %d)", args[0], statusObservers.count())
+	case "removestatusobserver":
+		if len(args) < 1 {
+			log.Errorf("Usage: removestatusobserver <jid>")
+			return
+		}
+		statusObservers.remove(normalizeStatusJid(args[0]))
+		log.Infof("Status observer removed: %s (count %d)", args[0], statusObservers.count())
+	case "statusack":
+		// Java 已落库（或已明确判定丢弃）→ 删除 outbox 记录，停止重放
+		if len(args) < 1 {
+			log.Errorf("Usage: statusack <statusId>")
+			return
+		}
+		statusOutboxAck(args[0])
 	case "unsubscribepresence":
 		// 删除/改号 observer 的退订，两层：
 		//   A. 协议级退订（新增）：向服务器发送 <presence type="unsubscribe">，停止该 JID 的
@@ -1559,6 +1611,13 @@ func handler(rawEvt interface{}) {
 		time.Sleep(3 * time.Second)
 		os.Exit(43)
 	case *events.Message:
+		// Status（WhatsApp 动态）分支必须**最先**处理并 return：动态是发往 status@broadcast 的
+		// 普通消息，若落到下面的通用逻辑，会被当成「收到一条消息」上报 Java，把 observer 误标
+		// ONLINE 并写一条脏 History（可行性验证文档 §3.3 记录的现存 bug）。
+		if evt.Info.Chat == types.StatusBroadcastJID {
+			handleStatusMessage(evt)
+			return
+		}
 		metaParts := []string{fmt.Sprintf("pushname: %s", evt.Info.PushName), fmt.Sprintf("timestamp: %s", evt.Info.Timestamp)}
 		if evt.Info.Type != "" {
 			metaParts = append(metaParts, fmt.Sprintf("type: %s", evt.Info.Type))
@@ -1644,12 +1703,12 @@ func handler(rawEvt interface{}) {
 				go func() {
 					dlCtx, dlCancel := context.WithTimeout(context.Background(), 60*time.Second)
 					defer dlCancel()
-					data, err := cli.Download(dlCtx, img)
+					tmpPath, err := downloadToTemp(dlCtx, img, evt.Info.ID)
 					if err != nil {
 						log.Errorf("Failed to download view-once image: %v", err)
 						return
 					}
-					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *img.FileLength, 0); err != nil {
+					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, tmpPath, *img.FileLength, 0); err != nil {
 						log.Errorf("Failed to upload view-once image: %v", err)
 					}
 				}()
@@ -1665,12 +1724,12 @@ func handler(rawEvt interface{}) {
 				go func() {
 					dlCtx, dlCancel := context.WithTimeout(context.Background(), 60*time.Second)
 					defer dlCancel()
-					data, err := cli.Download(dlCtx, video)
+					tmpPath, err := downloadToTemp(dlCtx, video, evt.Info.ID)
 					if err != nil {
 						log.Errorf("Failed to download view-once video: %v", err)
 						return
 					}
-					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *video.FileLength, *video.Seconds); err != nil {
+					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, tmpPath, *video.FileLength, *video.Seconds); err != nil {
 						log.Errorf("Failed to upload view-once video: %v", err)
 					}
 				}()
@@ -1686,12 +1745,12 @@ func handler(rawEvt interface{}) {
 				go func() {
 					dlCtx, dlCancel := context.WithTimeout(context.Background(), 60*time.Second)
 					defer dlCancel()
-					data, err := cli.Download(dlCtx, audio)
+					tmpPath, err := downloadToTemp(dlCtx, audio, evt.Info.ID)
 					if err != nil {
 						log.Errorf("Failed to download view-once audio: %v", err)
 						return
 					}
-					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, data, *audio.FileLength, *audio.Seconds); err != nil {
+					if err := uploadAndNotify(observerId, pushName, evt.Info.ID, tmpPath, *audio.FileLength, *audio.Seconds); err != nil {
 						log.Errorf("Failed to upload view-once audio: %v", err)
 					}
 				}()
@@ -1807,15 +1866,62 @@ func searchJid(ctx context.Context, lid types.JID) types.JID {
 	return pnForLID
 }
 
-func uploadAndNotify(observerId string, pushName string, fileName string, fileData []byte, fileLength uint64, seconds uint32) error {
-	mType := mimetype.Detect(fileData)
+// mediaTmpDir 是媒体下载的临时目录（与进程工作目录同级，即 userFile/{verifyCode}/ 下）。
+// 下载先落盘再上传，避免 cli.Download 的「密文+明文」双缓冲把 Go 堆撑到文件大小的 2 倍。
+var mediaTmpDir = "media-tmp"
+
+// downloadToTemp 把 WhatsApp 媒体流式下载到 mediaTmpDir 下的临时文件，返回该文件路径。
+// 调用方负责在用完后 os.Remove。失败时自行清理半成品文件。
+func downloadToTemp(ctx context.Context, msg whatsmeow.DownloadableMessage, name string) (string, error) {
+	if err := os.MkdirAll(mediaTmpDir, 0700); err != nil {
+		return "", fmt.Errorf("downloadToTemp: mkdir %s: %w", mediaTmpDir, err)
+	}
+	// 文件名只取 [A-Za-z0-9_-]，防消息 ID 里的异常字符穿透目录
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		}
+		return -1
+	}, name)
+	if safe == "" {
+		safe = "media"
+	}
+	path := filepath.Join(mediaTmpDir, safe+"-"+strconv.FormatInt(time.Now().UnixNano(), 36)+".bin")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
+	if err != nil {
+		return "", fmt.Errorf("downloadToTemp: create %s: %w", path, err)
+	}
+	err = cli.DownloadToFile(ctx, msg, f)
+	closeErr := f.Close()
+	if err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if closeErr != nil {
+		_ = os.Remove(path)
+		return "", closeErr
+	}
+	return path, nil
+}
+
+// uploadAndNotify 上传已落盘的 view-once 媒体并通知 Java Server。
+// srcPath 为 downloadToTemp 产出的临时文件路径，函数返回前必定删除（含上传失败转 pending 的情况，
+// 此时 savePendingUpload 已把文件搬到 pending-upload/ 下）。
+func uploadAndNotify(observerId string, pushName string, fileName string, srcPath string, fileLength uint64, seconds uint32) error {
+	defer os.Remove(srcPath)
+
+	mType, err := mimetype.DetectFile(srcPath)
+	if err != nil {
+		return fmt.Errorf("uploadAndNotify: detect type of %s: %w", srcPath, err)
+	}
 	miniType := mType.String()
 	objectKey := viewOnceObjectKey(fileName, mType.Extension())
 
 	// 向 Java Server 请求 S3 预签名 PUT URL 再直接上传（不再内嵌 AWS SDK，减小二进制与内存）
-	if err := uploadToS3(objectKey, fileData, miniType); err != nil {
+	if err := uploadFileToS3(presignViewOnceUploadPath, objectKey, srcPath, miniType, viewOnceUploadTimeout); err != nil {
 		// 完整恢复：Java 掉线导致预签名申请/上传失败时，媒体暂存本地，重连后自动重传并通知
-		if saveErr := savePendingUpload(observerId, pushName, fileName, fileData, fileLength, seconds, miniType); saveErr != nil {
+		if saveErr := savePendingUpload(observerId, pushName, fileName, srcPath, fileLength, seconds, miniType); saveErr != nil {
 			return fmt.Errorf("upload failed (%v) and pending save failed: %w", err, saveErr)
 		}
 		log.Warnf("view-once %s upload failed (%v), buffered to pending-upload for retry", fileName, err)
@@ -1833,44 +1939,72 @@ func uploadAndNotify(observerId string, pushName string, fileName string, fileDa
 		"objectKey":  objectKey,
 	})
 
-	// 上传完成：cli.Download 双缓冲（密文+明文）把 Go arena 撑到峰值，GC 后不归还 OS，
-	// 强制返还给系统，消除「当前 RSS 35-43MB / live heap 1-11MB」的峰值残留
+	// 上传完成：重置计时器让 heap 尽快回落到 memlimit 以下。流式下载后不再有整文件级分配，
+	// 这里只作廉价兜底（FreeOSMemory 会 stop-the-world，别放进热路径之外的地方）
 	debug.FreeOSMemory()
 
 	return nil
 }
 
-// uploadToS3 请求 S3 预签名 PUT URL 并上传文件内容。
-func uploadToS3(objectKey string, data []byte, contentType string) error {
+// presignViewOnceUploadPath / presignStatusUploadPath 分属两个业务的预签名接口。
+// 两者共用同一套 S3 上传实现，仅预签名端点不同。
+const (
+	presignViewOnceUploadPath = "/inner/presignViewOnceUpload"
+	presignStatusUploadPath   = "/inner/presignStatusUpload"
+
+	// viewOnceUploadTimeout: view-once 媒体小（图片为主），沿用原有 60s。
+	// Status 视频要更大更慢，走各自的 statusUploadTimeout。
+	viewOnceUploadTimeout = 60 * time.Second
+)
+
+// uploadFileToS3 以流式方式上传本地文件到 S3（预签名 PUT），内存占用与文件大小无关。
+func uploadFileToS3(presignPath, objectKey, filePath, contentType string, timeout time.Duration) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return uploadStreamToS3(presignPath, objectKey, f, st.Size(), contentType, timeout)
+}
+
+// uploadStreamToS3 请求 S3 预签名 PUT URL 后流式上传 body。size 必须显式传入：
+// http.NewRequest 只对 *bytes.Reader 等少数类型自动推断 ContentLength，*os.File 不会，
+// 于是请求会退化成 Transfer-Encoding: chunked，S3 对分块 PUT 直接拒绝。
+func uploadStreamToS3(presignPath, objectKey string, body io.Reader, size int64, contentType string, timeout time.Duration) error {
 	if *serverUrl == "" {
-		return fmt.Errorf("uploadToS3: --server-url not configured, cannot presign upload")
+		return fmt.Errorf("uploadStreamToS3: --server-url not configured, cannot presign upload")
 	}
-	presigned, err := requestPresignedPut(objectKey)
+	presigned, err := requestPresignedPut(presignPath, objectKey)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPut, presigned, bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPut, presigned, body)
 	if err != nil {
 		return err
 	}
+	req.ContentLength = size
 	req.Header.Set("Content-Type", contentType)
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("S3 presigned PUT failed: %d %s", resp.StatusCode, string(body))
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("S3 presigned PUT failed: %d %s", resp.StatusCode, string(respBody))
 	}
 	return nil
 }
 
-// requestPresignedPut 向 Java Server 请求 S3 预签名 PUT URL（GET /inner/presignViewOnceUpload）。
-func requestPresignedPut(objectKey string) (string, error) {
+// requestPresignedPut 向 Java Server 请求 S3 预签名 PUT URL。
+func requestPresignedPut(presignPath, objectKey string) (string, error) {
 	// TrimRight 防 serverUrl 带尾斜杠产生双斜杠
-	reqURL := strings.TrimRight(*serverUrl, "/") + "/inner/presignViewOnceUpload?objectKey=" + url.QueryEscape(objectKey)
+	reqURL := strings.TrimRight(*serverUrl, "/") + presignPath + "?objectKey=" + url.QueryEscape(objectKey)
 	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", err

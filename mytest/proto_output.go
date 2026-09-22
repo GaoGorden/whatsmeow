@@ -31,6 +31,9 @@ const (
 	MsgViewOnceFile    = "viewOnceFile"
 	MsgViewOnceEnabled = "viewOnceEnabled"
 	MsgPairError       = "pairError"
+	// MsgStatusFile: Status（动态）条目上报。走 PresenceCache.Notify 通道（掉线缓冲 + 重连重放），
+	// 不要裸 ProtoOutput —— 它拿不到缓冲，Java 掉线期间会直接丢。
+	MsgStatusFile = "statusFile"
 
 	// Stability monitoring messages
 	MsgHeartbeat      = "heartbeat"      // Periodic health report (goroutines, memory, subscribers)
