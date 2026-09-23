@@ -10,7 +10,7 @@
 - **数据库**：SQLite（每个用户一个 `mdtest.db`，通过 sqlstore 管理）
 - **构建**：`cd mytest && go build`（单客户端）或 `cd mytest2/main && go build`（多客户端 HTTP 版）
 - **Go SDK 路径**：`D:\developmentKit\gosdk`
-- **部署**：`scp-linux-go-file.ps1` 上传编译好的 Linux 可执行文件到 Server
+- **部署**：`wa.ps1 deploy go` 上传编译好的 Linux 可执行文件到 Server（原 `scp-linux-go-file.ps1` 已并入统一入口 `wa.ps1`）（2026-09-23 核对）
 - **CGO**：需要（`import "C"`，编译时依赖 C 库）
 
 ## 两套入口程序
@@ -90,8 +90,8 @@ cli = whatsmeow.NewClient(device, log)
 2. 通过 `searchPhoneNum()` 将 LID 解析为真实电话号码
 3. 通过 `getNickName()` 获取联系人昵称（优先 FullName → PushName）
 4. 异步调用 `downloadToTemp()` 把媒体**流式下载**到 `media-tmp/{msgID}.bin`（内部用 `cli.DownloadToFile`）
-5. `uploadAndNotify()` 上传到 S3 并输出 JSON 通知（`ProtoOutput(MsgViewOnceFile)`，Java Server 通过 socket/Proto 协议解析），返回前删除临时文件
-   - **上传方式（方案B）**：Go 不再内嵌 AWS SDK，而是 `GET {server-url}/inner/presignViewOnceUpload?objectKey=...` 向 Java Server 申请 S3 预签名 PUT URL，再直接 HTTP PUT 上传。`--server-url` 由 Java 启动时传入。详见 `doc/Go进程内存优化与预签名上传方案.md`
+5. `uploadAndNotify()` 上传到 S3 并输出 JSON 通知（`presenceCache.Notify(MsgViewOnceFile, ...)`，**不得裸 `ProtoOutput`**——裸输出拿不到掉线缓冲，Java 掉线期间会直接丢；Java Server 通过 socket/Proto 协议解析），返回前删除临时文件（2026-09-23 核对）
+   - **上传方式（方案B）**：Go 不再内嵌 AWS SDK，而是 `GET {server-url}/inner/presignViewOnceUpload?objectKey=...` 向 Java Server 申请 S3 预签名 PUT URL，再直接 HTTP PUT 上传。`--server-url` 由 Java 启动时传入。移除 AWS SDK 使二进制从 **58MB 降到 41MB**。详见 `doc/Go进程内存优化与预签名上传方案.md`
    - **完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，Java 重连后 `flushPendingUploads` 补传 + `presenceCache.Notify` 补通知（`pending_upload.go`）
    - **内存优化（方案A）**：`main()` 开头 `debug.SetMemoryLimit(64<<20)` 设堆软上限，防 view-once 下载/历史同步瞬时大分配打穿节点
    - **内存优化（方案B，2026-08-26）**：`cli.Download()` 双缓冲（`io.ReadAll` 密文 + `cbcutil.Decrypt` 明文）会把 Go heap arena 撑到峰值，但 GC 后 Go **不归还**扩大的 arena 给 OS（GOMEMLIMIT 是软上限、不触发去提交），形成「当前 RSS 35-43MB / live heap 仅 1-11MB」的峰值残留。在 `uploadAndNotify`（直接上传成功）、`savePendingUpload`（暂存落盘后）、`flushPendingUploads`（每个重传成功项）三处各加 `debug.FreeOSMemory()` 强制归还。详见 `doc/linux_go内存优化方案_viewonce流式与FreeOSMemory.md`
@@ -125,29 +125,17 @@ if lastSeen != "" && lastSeen != "deny" {
 
 被监控联系人在 WhatsApp 中设置的 **"Last Seen & Online" 隐私选项** 决定了 `last` 属性的值：
 
-| 用户隐私设置 | 监控者收到 | `evt.LastSeen` | stdout 输出 |
+| 用户隐私设置 | 监控者收到 | `evt.LastSeen` | proto `lastSeen` 字段 |
 |---|---|---|---|
-| Everyone（`all`） | `last="时间戳"` | 有值 | `offline: <jid>%!(EXTRA time.Time=...)` |
-| My Contacts（`contacts`），监控者在联系人列表 | `last="时间戳"` | 有值 | 同上 |
-| My Contacts，监控者不在联系人列表 | `last="deny"` | 零值 | `offline: <jid>` |
-| Nobody（`none`） | `last="deny"` | 零值 | `offline: <jid>` |
+| Everyone（`all`） | `last="时间戳"` | 有值 | 有值 |
+| My Contacts（`contacts`），监控者在联系人列表 | `last="时间戳"` | 有值 | 有值 |
+| My Contacts，监控者不在联系人列表 | `last="deny"` | 零值 | 缺省（空串） |
+| Nobody（`none`） | `last="deny"` | 零值 | 缺省（空串） |
 
-**两种离线输出格式的原因**：
-
-Go 端代码（`main.go`）中有一个格式串 bug：
-```go
-if evt.LastSeen.IsZero() {
-    log.Infof("offline: %s", result)                    // 1个 %s，1个参数 → 正常
-} else {
-    log.Infof("offline: %s", result, evt.LastSeen)       // 1个 %s，2个参数 → bug
-}
-```
-第二行格式串只有 1 个 `%s` 但传了 2 个参数，Go 的 `fmt.Sprintf` 会将多余的 `time.Time` 参数以 `%!(EXTRA time.Time=...)` 格式追加输出。Java 端 `ProcessLineUtils` 已"将错就错"地按此格式解析（匹配 `EXTRA time.Time=` 字符串）。
-
-**stdout 输出格式**（经 `searchPhoneNum()` 解析 LID → 电话号码后）：
-- 上线：`online: {phoneNumber}`
-- 离线（无 LastSeen）：`offline: {phoneNumber}`
-- 离线（有 LastSeen）：`offline: {phoneNumber}%!(EXTRA time.Time={lastSeenTime})`
+**输出方式**：presence 统一走 `PresenceCache.Handle` → proto（`##PROTO##{"type":"presence","state":"online"|"offline","jid":...,"lastSeen":...}`），
+经 `searchPhoneNum()` 解析 LID → 电话号码后填入 `jid`；`lastSeen` 用 UTC 墙钟格式化，零值时不下发该字段。
+（2026-09-23 核对：早期「stdout `offline: %!(EXTRA time.Time=...)` 格式串 bug + Java 将错就错解析」的做法已整体移除，
+Go 侧不再输出 `offline:`/`online:` 文本行，Java 侧对应解析亦已删除）
 
 ### 3. LID 解析
 
@@ -185,6 +173,7 @@ Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一
 | `subscribepresence <jid>` | 订阅联系人在线状态（粘性订阅：即使断线发送失败也记录 JID，重连后 `ResubscribeAll` 补发；发送失败不再阻断，`ClearUnsubscribed` 始终执行）。**重加 JID（仍带退订标记）先协议退订（实测无效，best-effort）再订阅**；2s 内无推送则强制重连兜底（重连为唯一可靠重推机制） |
 | `unsubscribepresence <jid>` | **协议退订 + 软退订双层**：① 协议退订（`UnsubscribePresence` 发 `<presence type=unsubscribe>`，whatsmeow 上游无此 API，**实测无效**——服务器不响应停推→重推语义，仅 best-effort）；② 软退订（移出重订阅集 + 标记过滤 + 清空 PresenceCache）。删除/改号 observer 时由 Server 下发 |
 | `checkuser <phones...>` | 检查号码是否注册 WhatsApp |
+| `querypresence` | 回吐每 JID 订阅状态 + presence 新鲜度快照（合并 `PresenceManager.Snapshot()` 与 `PresenceCache.Snapshot()`），经 `presenceStatus` proto 返回，供 Web 管理后台判断监听有效性。**Server 实际下发**（`ProcessUtils` 里有调用点）（2026-09-23 核对） |
 | `getavatar <jid>` | 获取头像 URL |
 | `getgroup <jid>` | 获取群组信息 |
 | `send <jid> <text>` | 发送文本消息 |
@@ -196,6 +185,7 @@ Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一
 | `syncstatusobservers <jid...>` | **全量覆盖** Status 过滤集合（`statusObservers.replace`，**空集合 = 清空**）。Java 侧刻意只提供全量、不做增量：增量漏一次会静默地让集合与服务器侧不一致（表现为「某些联系人永远收不到动态」且不报错） |
 | `addstatusobserver <jid>` / `removestatusobserver <jid>` | 增/删单个成员。**Java 侧无调用点**，留作 Web 调试控制台的调试命令；业务路径一律走 `syncstatusobservers` 全量覆盖 |
 | `statusack <statusId>` | Server 确认某条 Status 已终态落库（或被唯一键判为重复 / 毒报文 / 刻意丢弃）→ Go 删除对应 `status-outbox/{statusId}.json`。**不 ack 的场景只有 `subUser == null`**（用户释放路径上的瞬态，宁重勿丢） |
+| `debug <cmd> [args...]` | 调试包装器：把任意子命令重定向 stdout 后执行（20s 超时），连同期间捕获的 proto 一并经 `debugResult` proto 回吐（output 截断至末 100KB）。**Server 实际下发**（Web 调试控制台链路）（2026-09-23 核对） |
 
 ### 6. Status（动态）采集
 
@@ -367,6 +357,8 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 | `MsgResubscribe` | `resubscribe` | 重连后重订阅结果 |
 | `MsgStreamReplaced` | `streamReplaced` | 被顶号（其他设备登录） |
 | `MsgLoggedOut` | `loggedOut` | 服务端登出 |
+| `MsgPresenceStatus` | `presenceStatus` | 每 JID 订阅状态 + presence 新鲜度快照（`querypresence` 命令响应）：`count` / `items[]`（每项 `jid` / `subscribed` + `PresenceCache` 的 latest/lastArrivalMs）。供 Web 管理后台判断监听有效性 |
+| `MsgDebugResult` | `debugResult` | 通用调试命令输出快照（`debug` 命令响应）：`cmd` / `args` / `output`（含命令期间捕获的 proto，截断至末 100KB）/ `ms` |
 
 **稳定性机制**：
 - **连接用途标记协议**（`startCommandSocket` accept 循环）：首行发 `attach` 的连接才 `setProtoConn + Replay + flushPendingUploads`；命令/探测连接（sendCommand、health checker probe）只喂命令、不设后端、不重放——避免非 attach 连接提前消耗 PresenceCache 缓冲导致事件写进无人读取的 socket 而丢失。⚠️ **部署顺序：Java 先于 Go**（旧 Java + 新 Go 断裂）。见 `doc/Server重启窗口Observer操作与presence重放风险修复.md`
@@ -376,7 +368,7 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
   **Status 指标**（2026-09-22 追加 5 项）：`status_enabled`(总开关)、`status_observers`(过滤集合大小)、`status_pending`(**outbox 待确认条数**)、`status_dropped`(**累计丢弃数**)、`status_queue`(待处理队列长度)。判读：`status_dropped > 0` = **有动态永久丢失，需告警**；`status_pending` 长期不降 = Server 没在 ack（多半是旧版 Server 未部署 `statusack`）
 - **StreamReplaced 处理**：发送 Proto 通知 → `cli.Disconnect()` → `time.Sleep(3s)` → `os.Exit(42)`
 - **LoggedOut 处理**：发送 Proto 通知 → `cli.Disconnect()` → `time.Sleep(3s)` → `os.Exit(43)`
-- **ViewOnce 超时保护**：下载 60 秒超时，上传 30 秒超时（`context.WithTimeout`）
+- **ViewOnce 超时保护**：下载 60 秒超时（`context.WithTimeout`），上传 60 秒超时（`viewOnceUploadTimeout`，经 `uploadFileToS3` 的 `timeout` 参数传入）（2026-09-23 核对）
 
 ### Go → Java（库级别日志 — 辅助）
 
@@ -431,17 +423,26 @@ cd whatsmeow
 
 ### 冲突处理
 
-如果合并时出现冲突，脚本会提示手动处理。当前核心库的定制代码集中在 3 个文件：
+如果合并时出现冲突，脚本会提示手动处理。**库层（`mytest/`、`mytest2/` 之外）的 fork 定制共 5 个文件**，分两类
+（2026-09-23 核对：原写「集中在 3 个文件」并宣称 `store/clientpayload.go`、`types/events/events.go` 与上游完全一致，
+与该节之外的 §0 / `presence.go` 定制记载自相矛盾，且经 `git diff upstream/main` 核对不实）：
+
+**一、改上游既有文件（会冲突，需手动加回）**：
 
 | 文件 | 改动内容 | 处理方式 |
 |------|---------|---------|
 | `client.go` | `OnLoginSuccess` 回调、日志改进、passkey 字段简化 | 接受上游改动，手动加回 `OnLoginSuccess` 回调 |
 | `connectionevents.go` | `OnLoginSuccess` 回调调用、日志改进 | 接受上游改动，手动加回回调调用 |
 | `pair.go` | `IOS_PHONE → PairClientChrome` 映射 | 接受上游改动，手动加回 case |
+| `presence.go` | 新增 `UnsubscribePresence()`（上游无此 API，发 `<presence type=unsubscribe>`） | 上游若无同名函数改动则无冲突；若冲突，保留本 fork 的 `UnsubscribePresence` |
 
-以下文件与上游完全一致，无需处理：
-- `store/clientpayload.go` ✓（iOS 设备指纹通过 `SetDeviceFingerprintIOS()` 在运行时配置）
-- `types/events/events.go` ✓
+**二、fork 新增文件（上游不存在，一般无冲突，但需确认未被上游同名文件挤掉）**：
+
+- `store/deviceconfig.go` —— `SetDeviceFingerprintIOS()`，见上文 §0。**这正是 `store/clientpayload.go` 能保持零定制的原因**
+  （iOS 指纹已提取到该文件在运行时配置）。
+
+**其余文件在本 fork 无定制**：与 `upstream/main` 的差异仅来自「上游比 fork 新」（例如 `store/clientpayload.go` 只差 `waVersion` 常量、
+`types/events/events.go` 只差上游**删除**的 `RotateADVSecret` / `HistorySync.Notification`），合并时一律接受上游改动。
 
 ### 手动同步（不使用脚本）
 
