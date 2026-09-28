@@ -29,7 +29,7 @@
 | `daemon_other.go` | 非 Linux daemon 化 no-op（Windows 联调用） |
 | `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅；含退订标记集 `unsubscribedJIDs`，软退订 + 协议退订（`UnsubscribePresence`，**实测无效**，best-effort）双层；`Subscribe` 为**粘性订阅**——断线发送失败也记录 JID，重连后 `ResubscribeAll` 补发；`MarkPriority` **优先重订阅**重加 JID（ResubscribeAll 先发它，避免 map 随机顺序把重加 JID 排到最后拖慢恢复）；重加 observer 靠 2s 无推送强制重连兜底） |
 | `presence_cache.go` | **Presence 事件缓存与重放**：Java 掉线期间缓存上下线通知，重连后按序重放（含 `ts` 时间戳精确还原）；`Notify` 同时缓冲 view-once 等运行时通知；`Remove(jid)` 清空单 JID 缓存（软退订用）；`lastArrival`/`HasFreshEvent` 供重加订阅后 2s 无推送判定（触发强制重连兜底）。详见 `doc/Go端presence事件缓存与重放方案.md`、`doc/Server重启窗口Observer操作与presence重放风险修复.md` |
-| `status.go` | **Status（动态）采集主体**（2026-09-22 新增）：`handleStatusMessage` = 过滤链（总开关 / `IsFromMe` / 纯 SKDM / `ProtocolMessage`(REVOKE) / 号码过滤集 / LRU 去重）→ 类型分派（image/video/audio 走下载上传，text 直发）→ worker 池（并发 2）→ outbox。含 `statusObserverSet`（全量覆盖 `replace`）、`statusSeenSet`（5000 条环形去重）、`normalizeStatusJid`、`statusObjectKey`、磁盘水位暂停。详见 `doc/Status动态追踪_Go端实施记录.md`、方案 `doc/Status动态追踪功能实现方案.md` |
+| `status.go` | **Status（动态）采集主体**（2026-09-22 新增）：`handleStatusMessage` = 过滤链（总开关 / `IsFromMe` / 纯 SKDM / `ProtocolMessage`(REVOKE) / 号码过滤集 / LRU 去重）→ 类型分派（image/video/audio 走下载上传；**纯文本直接丢弃**，2026-09-28）→ worker 池（并发 2）→ outbox。含 `statusObserverSet`（全量覆盖 `replace`）、`statusSeenSet`（5000 条环形去重）、`normalizeStatusJid`、`statusObjectKey`、磁盘水位暂停。详见 `doc/Status动态追踪_Go端实施记录.md`、方案 `doc/Status动态追踪功能实现方案.md` |
 | `diskfree_linux.go` / `diskfree_other.go` | `statusFreeDiskBytes(path)` 平台分叉（`syscall.Statfs`）。**非 Linux 返回 `ok=false`** → 磁盘水位保护只在生产生效，本地 Windows 联调不会被暂停逻辑卡住（对照 `proc_mem_linux.go` / `proc_mem_other.go`） |
 | `status_test.go` | Status 单测 9 个（过滤链早退、去重集淘汰、outbox 生命周期/裁剪、payload 字段表）。`statusMaxFileBytes` / `statusOutboxMax` 写成 `var` 就是为了单测能调小 |
 | `pending_upload.go` | **View-once 完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，attach/周期触发重传 + 补通知，上限 **100 条 + 2GiB**（双上限，任一超标按 mtime 丢最旧）。**2026-09-22 流式改造**：下载走 `downloadToTemp`（`cli.DownloadToFile` 落临时文件）、上传走 `uploadFileToS3`、暂存走 `moveFile`（rename 优先），全链路内存 O(32KB) 与文件大小无关。详见 `doc/pending-upload流式改造实施记录.md`、`doc/Go进程内存优化与预签名上传方案.md`「完整恢复」。**同批新增 `Source` 判别字段**：`flushPendingUploads` 按 `meta.Source == "status"` 分流到 `flushPendingStatus`——Status 复用这套暂存目录，就同时复用了条数/字节双上限、rename 搬移与 attach/周期两条重传触发路径；`Source` 为空（含历史遗留记录）走原 view-once 路径。`flushPendingStatus` 用记录里**存下的 `ObjectKey`**（不重新推导，否则重传会落到与 DB 不同的键上） |
@@ -199,9 +199,16 @@ Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一
 2. **过滤按电话号码**（不是 JID 字符串比对）：比对前统一走 `normalizeStatusJid` 归一化
    （剥 `+` 前缀、去设备号后缀、补 `@s.whatsapp.net`）。**这一步不做就会静默失配**——
    表现为「某些联系人永远收不到动态」，且没有任何报错。
-3. **纯文字动态也要保存文案**（产品要求）：`kind=text` 走**完全独立的一条早退路径**——
-   没有文件就 `publishStatus` 直接上报，**不碰**下载 / S3 / worker 池 / 队列背压那一整套。
-   这是实现时最容易漏的地方（拿一个空 media message 去下载）。
+3. 🔴 ~~**纯文字动态也要保存文案**（产品要求）：`kind=text` 走完全独立的一条早退路径……~~
+   **已作废（2026-09-28 产品要求「不监听也不展示纯文本动态」）**：纯文本现在在 `default:` 分支
+   **直接丢弃、连上报都不做**（原先那条 `publishStatus(job.payload("", ""))` 的早退路径已删除）。
+   原因是它虽然"没有文件、不占资源"，但仍会进 `status_file`、参与未读数与 5 分钟聚合推送，
+   而 App 详情页只能渲染出一行文字卡片 —— 没有任何可看/可下/可分享的内容。
+   ⚠️ **带图动态的 caption 不受影响**：图片/视频走各自分支的 `job.text = m.GetCaption()`，
+   语音恒空（AudioMessage 没有 caption 字段）。
+   ⚠️ 常量 `statusKindText` 保留但已不产出；**存量** `status_file` 里的 `kind='text'` 行由
+   Proxy 查询侧过滤（见 `watracker-proxy/CLAUDE.md`）。
+   详见 `doc/不监听与展示纯文本动态实施记录.md`。
 
 **事件分支必须最先 return**（`main.go` 的 `events.Message`）：动态是发往 `status@broadcast` 的**普通消息**，
 若不拦在通用逻辑之前，会被当成「收到一条消息」上报 Java → observer 误标 `ONLINE` + 写脏 `History`。

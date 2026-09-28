@@ -65,6 +65,9 @@ const (
 	// 记录随之消失；此间隔只为兜「Java 不 ack（旧版本）时每 60s 全量重发」这一情形。
 	statusReplayMinGap = 5 * time.Minute
 
+	// ⚠️ statusKindText **已不再产出**（2026-09-28）：纯文本动态在入口就被丢弃，
+	// 不再上报给 Java。常量保留只为记录协议取值（存量 status_file 里仍有 kind='text' 的行，
+	// Proxy 侧查询已按 `kind <> 'text'` 过滤，见 StatusFileRepository）。
 	statusKindText  = "text"
 	statusKindImage = "image"
 	statusKindVideo = "video"
@@ -288,17 +291,18 @@ func handleStatusMessage(evt *events.Message) {
 		// AudioMessage 没有 caption 字段，text 恒为空（方案 §2.4）
 		job.media = m
 	default:
-		text := evt.Message.GetExtendedTextMessage().GetText()
-		if text == "" {
-			text = evt.Message.GetConversation()
-		}
-		if text == "" {
-			return // 既无媒体也无正文，按未知类型丢弃
-		}
-		// 纯文字动态：无文件 → 不碰下载/上传/并发/背压（方案 §3.2）
-		job.kind = statusKindText
-		job.text = text
-		publishStatus(job.payload("", ""))
+		// 纯文字动态：**不监听、不上报**（2026-09-28 产品要求）。
+		//
+		// 原先这里会把纯文字动态当成一条 kind=text、无文件的记录 publish 出去
+		//（方案 §3.2「无文件 → 不碰下载/上传/并发/背压」）—— 它照样进 status_file、
+		// 照样参与未读数与 5 分钟聚合推送，而 App 详情页只有一行文字、没有任何
+		// 可看/可下/可分享的内容。现在连"监听"这一层都不再做：落进本分支的一律丢弃
+		//（既无媒体也无正文的未知类型同样在此丢弃）。
+		//
+		// ⚠️ **动态自带的文案不受影响**：图片/视频的 caption 走上面两个分支的
+		// `job.text = m.GetCaption()`，语音恒空（AudioMessage 没有 caption 字段）——
+		// 本改动只砍掉「纯文本」这一种动态，不会让带图动态丢文案。
+		log.Debugf("status: drop text-only status %s from status@broadcast", evt.Info.ID)
 		return
 	}
 
