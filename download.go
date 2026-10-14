@@ -49,6 +49,18 @@ const (
 
 	MediaStickerPack   MediaType = "WhatsApp Sticker Pack Keys"
 	MediaLinkThumbnail MediaType = "WhatsApp Link Thumbnail Keys"
+
+	// ⚠️ 以下两个是本 fork 的定制（上游只有 MediaLinkThumbnail），见 CLAUDE.md「上游同步」。
+	//
+	// 图片/视频消息里除了内嵌的 jpegThumbnail（1~4KB 的小图），还可能另有一份**单独上传**的
+	// 缩略图，由 thumbnailDirectPath / thumbnailSHA256 / thumbnailEncSHA256 三个字段指向，
+	// 分辨率明显更高。它用**同一条消息的 mediaKey** 加密，但 HKDF 的 app-info 不同。
+	//
+	// app-info 串的来历：Baileys 的 MEDIA_HKDF_KEY_MAPPING 把 'thumbnail-image' → 'Image Thumbnail'，
+	// hkdfInfoKey 再包成 `WhatsApp ${x} Keys` —— 与上游 MediaLinkThumbnail 完全同一套命名规则
+	// （'Link Thumbnail' → "WhatsApp Link Thumbnail Keys"）。视频同理。
+	MediaImageThumbnail MediaType = "WhatsApp Image Thumbnail Keys"
+	MediaVideoThumbnail MediaType = "WhatsApp Video Thumbnail Keys"
 )
 
 // DownloadableMessage represents a protobuf message that contains attachment info.
@@ -68,7 +80,8 @@ type MediaTypeable interface {
 
 // DownloadableThumbnail represents a protobuf message that contains a thumbnail attachment.
 //
-// This is primarily meant for link preview thumbnails in ExtendedTextMessage.
+// 上游把它定位给「扩展文本消息的链接预览缩略图」；本 fork 额外让 ImageMessage / VideoMessage
+// 也实现它 —— 它们同样带 thumbnailDirectPath 一族字段（单独上传的那份缩略图）。
 type DownloadableThumbnail interface {
 	proto.Message
 	GetThumbnailDirectPath() string
@@ -89,6 +102,8 @@ var (
 	_ DownloadableMessage   = (*waE2E.HistorySyncNotification)(nil)
 	_ DownloadableMessage   = (*waServerSync.ExternalBlobReference)(nil)
 	_ DownloadableThumbnail = (*waE2E.ExtendedTextMessage)(nil)
+	_ DownloadableThumbnail = (*waE2E.ImageMessage)(nil)
+	_ DownloadableThumbnail = (*waE2E.VideoMessage)(nil)
 	_ DownloadableMessage   = (*types.StickerPackItem)(nil)
 )
 
@@ -107,6 +122,9 @@ var classToMediaType = map[protoreflect.Name]MediaType{
 
 var classToThumbnailMediaType = map[protoreflect.Name]MediaType{
 	"ExtendedTextMessage": MediaLinkThumbnail,
+	// 本 fork 定制：图片/视频的独立缩略图。
+	"ImageMessage": MediaImageThumbnail,
+	"VideoMessage": MediaVideoThumbnail,
 }
 
 var mediaTypeToMMSType = map[MediaType]string{
@@ -119,6 +137,15 @@ var mediaTypeToMMSType = map[MediaType]string{
 
 	MediaStickerPack:   "sticker-pack",
 	MediaLinkThumbnail: "thumbnail-link",
+
+	// 本 fork 定制。命名沿用 WhatsApp 自己的 `thumbnail-<x>` 规则
+	// （与 thumbnail-link / thumbnail-sticker-pack 同构）。
+	//
+	// ⚠️ 这一项只影响下载 URL 里的 `mms-type=` 查询参数（真正的对象路径来自 directPath），
+	// 该参数的取值缺少公开文档。若实测下载被拒，改试 "image" / "video"
+	// 即可 —— mytest 的缩略图探测（statusThumbAttempts）就是为一次性试出正确答案而留的。
+	MediaImageThumbnail: "thumbnail-image",
+	MediaVideoThumbnail: "thumbnail-video",
 }
 
 // DownloadAny loops through the downloadable parts of the given message and downloads the first non-nil item.
@@ -151,6 +178,9 @@ func (cli *Client) DownloadAny(ctx context.Context, msg *waE2E.Message) (data []
 //	var msg *waE2E.Message
 //	...
 //	thumbnailImageBytes, err := cli.DownloadThumbnail(msg.GetExtendedTextMessage())
+//
+// 本 fork 另支持 ImageMessage / VideoMessage —— 它们那份独立上传的缩略图比内嵌的
+// jpegThumbnail 清楚得多，是 Status 网格缩略图发糊的修复手段（见 mytest/status.go）。
 func (cli *Client) DownloadThumbnail(ctx context.Context, msg DownloadableThumbnail) ([]byte, error) {
 	mediaType, ok := classToThumbnailMediaType[msg.ProtoReflect().Descriptor().Name()]
 	if !ok {

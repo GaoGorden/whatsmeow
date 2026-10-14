@@ -442,6 +442,7 @@ cd whatsmeow
 | `connectionevents.go` | `OnLoginSuccess` 回调调用、日志改进 | 接受上游改动，手动加回回调调用 |
 | `pair.go` | `IOS_PHONE → PairClientChrome` 映射 | 接受上游改动，手动加回 case |
 | `presence.go` | 新增 `UnsubscribePresence()`（上游无此 API，发 `<presence type=unsubscribe>`） | 上游若无同名函数改动则无冲突；若冲突，保留本 fork 的 `UnsubscribePresence` |
+| `download.go` | ① 新增 `MediaImageThumbnail`/`MediaVideoThumbnail` 两个媒体类型（app-info `WhatsApp Image/Video Thumbnail Keys`）；② `classToThumbnailMediaType` 补 `ImageMessage`/`VideoMessage`（上游只认 `ExtendedTextMessage`）；③ 两个 interface 断言 | 接受上游改动，按 ① ② ③ 手动加回。用途见 `doc/Status缩略图清晰度修复实施记录.md`（Status 网格缩略图发糊） |
 
 **二、fork 新增文件（上游不存在，一般无冲突，但需确认未被上游同名文件挤掉）**：
 

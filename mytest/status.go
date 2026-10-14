@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"sort"
@@ -272,6 +274,7 @@ func handleStatusMessage(evt *events.Message) {
 		job.fileLength = m.GetFileLength()
 		job.text = m.GetCaption()
 		job.thumb = m.GetJPEGThumbnail()
+		job.thumbMsg = m
 		job.media = m
 	case evt.Message.GetVideoMessage() != nil:
 		m := evt.Message.GetVideoMessage()
@@ -281,6 +284,7 @@ func handleStatusMessage(evt *events.Message) {
 		job.seconds = m.GetSeconds()
 		job.text = m.GetCaption()
 		job.thumb = m.GetJPEGThumbnail()
+		job.thumbMsg = m
 		job.media = m
 	case evt.Message.GetAudioMessage() != nil:
 		m := evt.Message.GetAudioMessage()
@@ -379,6 +383,11 @@ type statusJob struct {
 	thumb       []byte
 	media       whatsmeow.DownloadableMessage
 	oversize    bool
+
+	// thumbMsg: 图片/视频消息本身。它除了内嵌的 jpegThumbnail 之外，还带一份
+	// **单独上传**的缩略图（thumbnailDirectPath 一族字段），分辨率高得多 ——
+	// 由 bestStatusThumb 在 worker 里按需下载（语音/无此字段时为 nil）。
+	thumbMsg whatsmeow.DownloadableThumbnail
 }
 
 // payload 构造 statusFile proto 载荷。字段与 Java 侧 StatusFileBean 严格对应。
@@ -441,12 +450,15 @@ func processStatusJob(job *statusJob) {
 		job.oversize = true
 	}
 
-	// 缩略图先传：它是消息里内嵌的小图（1~4KB），不占磁盘，且列表页靠它渲染。
+	// 缩略图先传：它不占磁盘，且 App 详情页的动态网格靠它渲染。
+	// bestStatusThumb 会优先取那份**单独上传**的缩略图（几百像素），拿不到再回退内嵌小图
+	// —— 网格每格约 300+ 物理像素，内嵌小图（几十~一百多像素）放大后明显发糊。
+	thumb := bestStatusThumb(job)
 	thumbKey := ""
-	if len(job.thumb) > 0 {
+	if len(thumb) > 0 {
 		key := job.objectKey + statusThumbSuffix
-		if err := uploadStreamToS3(presignStatusUploadPath, key, bytes.NewReader(job.thumb),
-			int64(len(job.thumb)), "image/jpeg", statusUploadTimeout); err != nil {
+		if err := uploadStreamToS3(presignStatusUploadPath, key, bytes.NewReader(thumb),
+			int64(len(thumb)), "image/jpeg", statusUploadTimeout); err != nil {
 			// 缩略图失败不该阻断整条动态：列表页少一张图，详情页仍能看到全尺寸媒体
 			log.Warnf("status %s: thumbnail upload failed: %v", job.statusID, err)
 		} else {
@@ -482,6 +494,185 @@ func processStatusJob(job *statusJob) {
 	}
 
 	publishStatus(job.payload(job.objectKey, thumbKey))
+}
+
+// ---------------------------------------------------------------------------
+// 缩略图择优：优先「独立缩略图」，回退内嵌小图
+// ---------------------------------------------------------------------------
+
+const (
+	// statusThumbTimeout: 独立缩略图是一次小图下载（几十 KB），30s 足够。
+	// 它还是**可选**的 —— 超时就回退内嵌小图，不能拖住整条动态的上报。
+	statusThumbTimeout = 30 * time.Second
+
+	// statusThumbProbeGiveUp: 连续多少条动态全候选都失败后放弃探测。
+	statusThumbProbeGiveUp = 5
+
+	statusThumbProbeUnknown = -1
+	statusThumbProbeOff     = -2
+)
+
+// statusThumbAttempt 是一次缩略图下载尝试 —— (app-info, mms-type) 组合。
+//
+// ⚠️ **这是探测期的临时结构**：WhatsApp 对「独立缩略图」（thumbnailDirectPath 指向的那一份）
+// 的 app-info / mms-type 没有公开文档。app-info 取自 Baileys 的 MEDIA_HKDF_KEY_MAPPING
+// （'thumbnail-image' → "WhatsApp Image Thumbnail Keys"，与 upstream 的 MediaLinkThumbnail
+// 完全同一套命名规则），mms-type 两种写法各试一次；第三项兜「与父媒体同 app-info」这一可能。
+//
+// 一趟真号跑完即可定下正确答案，之后把命中的那组固化进 whatsmeow 的
+// mediaTypeToMMSType 并删掉这里的候选。详见 doc/Status缩略图清晰度修复实施记录.md。
+type statusThumbAttempt struct {
+	appInfo whatsmeow.MediaType
+	mmsType string
+	label   string
+}
+
+// statusThumbAttemptsOf 给出某类动态的候选组合，**顺序 = 猜测的可信度**。
+func statusThumbAttemptsOf(kind string) []statusThumbAttempt {
+	if kind == statusKindVideo {
+		return []statusThumbAttempt{
+			{whatsmeow.MediaVideoThumbnail, "thumbnail-video", "video-thumbnail-keys"},
+			{whatsmeow.MediaVideoThumbnail, "video", "video-thumbnail-keys/mms=video"},
+			{whatsmeow.MediaVideo, "video", "parent-keys"},
+		}
+	}
+	return []statusThumbAttempt{
+		{whatsmeow.MediaImageThumbnail, "thumbnail-image", "image-thumbnail-keys"},
+		{whatsmeow.MediaImageThumbnail, "image", "image-thumbnail-keys/mms=image"},
+		{whatsmeow.MediaImage, "image", "parent-keys"},
+	}
+}
+
+// statusThumbProbe 记住探测结果，避免每条动态都试满候选：
+// winner < 0 表示未定（继续探测），>= 0 是命中的候选下标，statusThumbProbeOff 表示已放弃。
+// 全进程共用一个下标即可 —— 图片/视频的候选表结构一致（见 statusThumbAttemptsOf）。
+var statusThumbProbe = struct {
+	mu       sync.Mutex
+	winner   int
+	failures int
+}{winner: statusThumbProbeUnknown}
+
+// statusThumbNoBlobLogged: 「消息里没有独立缩略图」只报一次（INFO），其余降 Debug ——
+// 这条正是「方案 A 是否可行」的判据，必须在默认 INFO 级别下可见。
+var statusThumbNoBlobLogged atomic.Bool
+
+// bestStatusThumb 返回该动态要上传 S3 的缩略图字节。
+//
+// WhatsApp 消息里有**两份**缩略图：内嵌的 jpegThumbnail（1~4KB、几十到一百多像素，客户端自己
+// 也只拿它做模糊预览）与单独上传的 thumbnailDirectPath 那一份（几百像素）。App 详情页网格
+// 每格约 300+ 物理像素并 centerCrop，拿内嵌那份渲染必然发糊 —— 优先取后者。
+//
+// ⚠️ **失败一律回退内嵌小图**：这两份都只是「列表/网格用的小图」，拿不到独立缩略图时行为与
+// 改动前完全一致，不影响动态本身的上传与上报。
+func bestStatusThumb(job *statusJob) []byte {
+	if job.thumbMsg == nil {
+		// 语音：既没有封面也没有可下载的缩略图对象，安静返回（别占用下面那条「字段缺失」的日志）。
+		return job.thumb
+	}
+	if len(job.thumbMsg.GetThumbnailDirectPath()) == 0 {
+		// 图片/视频，但消息里没带独立缩略图 —— **这条正是「方案 A 是否可行」的判据**，
+		// 必须在默认 INFO 级别下可见；只报一次，其余降 Debug。
+		if statusThumbNoBlobLogged.CompareAndSwap(false, true) {
+			log.Infof("status thumb probe: 消息不含独立缩略图（thumbnailDirectPath 为空），本次示例 status=%s kind=%s inline=%d bytes(%s)",
+				job.statusID, job.kind, len(job.thumb), jpegDims(job.thumb))
+		} else {
+			log.Debugf("status %s: no separate thumbnail, use inline (%d bytes)", job.statusID, len(job.thumb))
+		}
+		return job.thumb
+	}
+
+	attempts := statusThumbAttemptsOf(job.kind)
+
+	statusThumbProbe.mu.Lock()
+	winner := statusThumbProbe.winner
+	statusThumbProbe.mu.Unlock()
+
+	switch {
+	case winner == statusThumbProbeOff:
+		return job.thumb
+	case winner >= 0 && winner < len(attempts):
+		data, ok := fetchStatusThumb(job, attempts[winner], false)
+		return preferLargerThumb(job, data, ok)
+	}
+
+	// 未定：按可信度顺序把候选试完，**下载成功即记住**（哪怕这一份不比内嵌的大）。
+	for i, a := range attempts {
+		data, ok := fetchStatusThumb(job, a, true)
+		if !ok {
+			continue
+		}
+		statusThumbProbe.mu.Lock()
+		if statusThumbProbe.winner < 0 {
+			statusThumbProbe.winner = i
+		}
+		statusThumbProbe.mu.Unlock()
+		return preferLargerThumb(job, data, true)
+	}
+
+	// 本条全部候选失败 → 回退内嵌小图。连续失败够多就整体放弃探测，避免每条动态都白试三次。
+	statusThumbProbe.mu.Lock()
+	statusThumbProbe.failures++
+	failures := statusThumbProbe.failures
+	if statusThumbProbe.winner < 0 && failures >= statusThumbProbeGiveUp {
+		statusThumbProbe.winner = statusThumbProbeOff
+	}
+	statusThumbProbe.mu.Unlock()
+	if failures == statusThumbProbeGiveUp {
+		log.Errorf("status thumb probe: %d 条动态的独立缩略图全部下载失败，放弃探测并回退内嵌小图（App 侧观感与改动前一致）", failures)
+	}
+	return job.thumb
+}
+
+// fetchStatusThumb 按给定组合下载独立缩略图，返回 (字节, 下载是否成功)。
+// **「是不是比内嵌的大」刻意不在这里判**（见 preferLargerThumb）：下载成功但更小，
+// 仍然证明这组 app-info / mms-type 是对的，要记为 winner。
+// loud=false 是「已确定组合后的常规路径」：失败只记 Debug（偶发抖动不该刷 WARN）；
+// loud=true 是探测路径：每次都记 WARN，好让一趟真号把所有失败原因看全。
+func fetchStatusThumb(job *statusJob, a statusThumbAttempt, loud bool) ([]byte, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), statusThumbTimeout)
+	defer cancel()
+	data, err := cli.DownloadMediaWithPath(ctx, job.thumbMsg.GetThumbnailDirectPath(),
+		job.thumbMsg.GetThumbnailEncSHA256(), job.thumbMsg.GetThumbnailSHA256(), job.thumbMsg.GetMediaKey(),
+		a.appInfo, a.mmsType, false)
+	if err != nil {
+		if loud {
+			log.Warnf("status thumb probe: status=%s kind=%s attempt=%s failed: %v", job.statusID, job.kind, a.label, err)
+		} else {
+			log.Debugf("status %s: separate thumbnail download failed (%s): %v", job.statusID, a.label, err)
+		}
+		return nil, false
+	}
+	if loud {
+		log.Infof("status thumb probe: RESOLVED kind=%s attempt=%s inline=%d bytes(%s) -> blob=%d bytes(%s)",
+			job.kind, a.label, len(job.thumb), jpegDims(job.thumb), len(data), jpegDims(data))
+	}
+	return data, true
+}
+
+// preferLargerThumb 只在「下载成功且确实更大」时采用独立缩略图，否则回退内嵌那份
+// —— 舍大取小没有任何理由，而内嵌那份至少不会更糊。
+func preferLargerThumb(job *statusJob, data []byte, ok bool) []byte {
+	if !ok || len(data) <= len(job.thumb) {
+		if ok {
+			log.Debugf("status %s: separate thumbnail (%d bytes) not larger than inline (%d bytes), keep inline",
+				job.statusID, len(data), len(job.thumb))
+		}
+		return job.thumb
+	}
+	return data
+}
+
+// jpegDims 只解 JPEG 文件头拿宽高（不解像素），用于把「糊」量化成可对账的数字。
+// 解不出来（非 JPEG / 头部残缺）返回 "?"，不影响主流程。
+func jpegDims(b []byte) string {
+	if len(b) == 0 {
+		return "-"
+	}
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(b))
+	if err != nil {
+		return "?"
+	}
+	return fmt.Sprintf("%dx%d", cfg.Width, cfg.Height)
 }
 
 // statusWaitForDisk 磁盘水位不足时暂停下载；返回 false 表示暂停超时后放弃下载。
