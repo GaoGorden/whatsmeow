@@ -155,7 +155,7 @@ WhatsApp 使用 LID（Linked ID）代替真实电话号码，需要反查：
 - 输出 `push name` 和 `phone number`（Java Server 解析为登录成功标记）
 - 解析自己的 LID
 
-- **配对码过期（~160s）**：whatsmeow 二维码耗尽后 WhatsApp 服务器会关闭登录 websocket（`pair-code.go`："160-second time limit"）；登录期 `cli.Store.ID==nil` → `autoReconnect`（client.go:618）直接 return **不重连**，进程保持断开。`handler()` 的 `*events.Disconnected` 分支检测到「登录期断开」（`!cli.IsLoggedIn()`，登录成功后运行期重连不命中）即输出 `MsgPairError`（`pairError`）→ Java 走既有 pairError 分支（ProcessUtils:661）下发 loginTimeout → App 立即显示「配对码已过期，重新发送」，**对齐真实配对码过期时刻**（~160s），而非等 Server 5 分钟 emitter 超时。QR 流程不受影响：`qrchan.go` QR 码耗尽走 `cli.Disconnect()`（预期断开，onDisconnect 不派发 Disconnected），QR 超时仍由 `qrTimeout` 处理。详见 `doc/登录超时与配对码过期对齐方案.md`
+- **配对码过期（~160s）**：whatsmeow 二维码耗尽后 WhatsApp 服务器会关闭登录 websocket（`pair-code.go`："160-second time limit"）；登录期 `cli.Store.ID==nil` → `autoReconnect`（client.go:618）直接 return **不重连**，进程保持断开。`handler()` 的 `*events.Disconnected` 分支检测到「登录期断开」（`!cli.IsLoggedIn()`，登录成功后运行期重连不命中）即输出 `MsgPairError`（`pairError`）→ Java 走既有 pairError 分支（ProcessUtils:661）下发 loginTimeout → App 立即显示「配对码已过期，重新发送」，**对齐真实配对码过期时刻**（~160s），而非等 Server 5 分钟 emitter 超时。⚠️ **Phase 2 起是否「真过期」由 Java 按 `code_issued` + `elapsed_ms` 判定**（见下方「配对失败事件处理」）：出码后 <120s 断开改记 `PAIR_NETWORK_DROP`。QR 流程不受影响：`qrchan.go` QR 码耗尽走 `cli.Disconnect()`（预期断开，onDisconnect 不派发 Disconnected），QR 超时仍由 `qrTimeout` 处理。详见 `doc/登录超时与配对码过期对齐方案.md`
 
 ### 5. 命令系统（socket 交互）
 
@@ -358,7 +358,7 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 | `MsgLogoutSuccess` | `logoutSuccess` | 登出确认 |
 | `MsgViewOnceFile` | `viewOnceFile` | 阅后即焚文件通知 |
 | `MsgViewOnceEnabled` | `viewOnceEnabled` | ViewOnce 开关确认 |
-| `MsgPairError` | `pairError` | 配对错误 |
+| `MsgPairError` | `pairError` | 配对错误。**Phase 2（2026-10-23）新增结构化字段**：`stage`(`pair_request`/`awaiting_code`/`pair_complete`/`connect`) / `reason`（机器码，如 `pair_hmac_mismatch`、`temp_banned`、`login_disconnected`）/ `status`（HTTP/IQ status 或 ban code 101–106，0 时不发）/ `elapsed_ms`（已出码按出码时刻算，未出码按 `pair-phone` 开始算）/ `code_issued`。🔴 `error` 原文逐字不变（老 Java 只按文本分类；下发给 App 的 SSE 文案仍是 `"pair error"`） |
 | `MsgStatusFile` | `statusFile` | **Status（动态）条目上报**（2026-09-22 新增）：`statusId` / `observerId` / `pushName` / `kind`(text·image·video·audio) / `miniType` / `fileLength` / `seconds` / `text`（文案，产品要求保存）/ `objectKey` / `thumbKey` / `postedAt`。⚠️ **必须走 `PresenceCache.Notify`，不得裸 `ProtoOutput`**——裸输出拿不到掉线缓冲，Java 掉线期间会直接丢。⚠️ `kind` 为媒体但 `objectKey` 为空 = 该条媒体不可用（超 100MB 只报元数据，或磁盘水位降级），App 侧据此渲染 |
 | `MsgHeartbeat` | `heartbeat` | 进程心跳（60s 间隔） |
 | `MsgResubscribe` | `resubscribe` | 重连后重订阅结果 |
@@ -366,6 +366,23 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 | `MsgLoggedOut` | `loggedOut` | 服务端登出 |
 | `MsgPresenceStatus` | `presenceStatus` | 每 JID 订阅状态 + presence 新鲜度快照（`querypresence` 命令响应）：`count` / `items[]`（每项 `jid` / `subscribed` + `PresenceCache` 的 latest/lastArrivalMs）。供 Web 管理后台判断监听有效性 |
 | `MsgDebugResult` | `debugResult` | 通用调试命令输出快照（`debug` 命令响应）：`cmd` / `args` / `output`（含命令期间捕获的 proto，截断至末 100KB）/ `ms` |
+
+**配对失败事件处理（Phase 2，2026-10-23）**：`handler()` 新增 `*events.PairError` / `TemporaryBan` /
+`ClientOutdated` / `ConnectFailure` / `StreamError` 五个分支，全部先 `if cli.IsLoggedIn() { return }`
+（运行期重连失败不污染关联统计）。
+🔴 **必须单独处理 `PairError`**：`pair.go:141-146` 在 `handlePair` 失败时**先 `cli.Disconnect()` 再派发
+`PairError`**，而 `Disconnect()` 内部 `expectDisconnect()` ⇒ `connect()` 里
+`!isExpectedDisconnect()` 不成立 ⇒ **`events.Disconnected` 不会触发**；`handleConnectFailure` 的默认
+分支同样先 `expectDisconnect()`。所以这 5 类事件今天原本一条都到不了 Java，只能等 5 分钟 emitter 超时。
+- 错误类型映射（`pairFailureOf`）：`ErrPairInvalidDeviceIdentityHMAC`→`pair_hmac_mismatch`(401)、
+  `ErrPairInvalidDeviceSignature`→`pair_signature_mismatch`(401)、`*PairProtoError`→`pair_proto_error`(500)、
+  `*PairDatabaseError`→`pair_db_error`(500)、`ErrPairRejectedLocally`→`pair_rejected_locally`(500)、
+  其它→`pair_completion_failed`。
+- 时间基准由 `pairAttempt`（`beginPairAttempt`/`markPairCodeIssued`/`endPairAttempt`）维护，
+  `emitPairError` 用 `reported` 保证**一次尝试只上报一条**；`*events.PairSuccess` 只清状态、不发消息。
+- 登录期 `Disconnected` 现在也带上 `code_issued` + `elapsed_ms`，由 **Java** 用 120s 阈值区分
+  「配对码过期」（`CODE_EXPIRED`）与「出码后网络中断」（`PAIR_NETWORK_DROP`）。
+- 单测：`mytest/pair_failure_test.go`（纯函数 `pairFailureOf` / `elapsedFor`）。
 
 **稳定性机制**：
 - **连接用途标记协议**（`startCommandSocket` accept 循环）：首行发 `attach` 的连接才 `setProtoConn + Replay + flushPendingUploads`；命令/探测连接（sendCommand、health checker probe）只喂命令、不设后端、不重放——避免非 attach 连接提前消耗 PresenceCache 缓冲导致事件写进无人读取的 socket 而丢失。⚠️ **部署顺序：Java 先于 Go**（旧 Java + 新 Go 断裂）。见 `doc/Server重启窗口Observer操作与presence重放风险修复.md`

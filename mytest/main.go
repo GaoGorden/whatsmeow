@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -70,6 +71,131 @@ var serverUrl = flag.String("server-url", "", "Java Server HTTP base URL for pre
 // daemonMode: 是否处于 daemon 模式（socketPath 非空）。启动早期根据 flag 设置。
 var daemonMode = false
 var pairRejectChan = make(chan bool, 1)
+
+// ---------------------------------------------------------------------------
+// 配对尝试状态（link_attempts 结构化原因，Phase 2）
+//
+// 目的：把「出码之后到底为什么失败」结构化地告诉 Java —— 仅靠文本只能猜。
+//  · startedAt    : 收到 pair-phone 命令的时刻（未出码时 elapsed 的基准）
+//  · codeIssuedAt : 首次把 pairing code 下发给 Java 的时刻（已出码后 elapsed 的基准）
+//  · reported     : 一次尝试只上报一条 pairError，防止 PairError 与网络级
+//                   Disconnected 竞争时双报
+//
+// ⚠️ 事件回调跑在 whatsmeow 的 goroutine 里，所有读写都过 mutex。
+// ---------------------------------------------------------------------------
+
+type pairAttempt struct {
+	mu           sync.Mutex
+	startedAt    time.Time
+	codeIssuedAt time.Time
+	codeIssued   bool
+	reported     bool
+}
+
+var curPairAttempt pairAttempt
+
+func beginPairAttempt() {
+	curPairAttempt.mu.Lock()
+	curPairAttempt.startedAt = time.Now()
+	curPairAttempt.codeIssuedAt = time.Time{}
+	curPairAttempt.codeIssued = false
+	curPairAttempt.reported = false
+	curPairAttempt.mu.Unlock()
+}
+
+func markPairCodeIssued() {
+	curPairAttempt.mu.Lock()
+	if !curPairAttempt.codeIssued {
+		curPairAttempt.codeIssued = true
+		curPairAttempt.codeIssuedAt = time.Now()
+	}
+	curPairAttempt.mu.Unlock()
+}
+
+func endPairAttempt() {
+	curPairAttempt.mu.Lock()
+	curPairAttempt.startedAt = time.Time{}
+	curPairAttempt.codeIssuedAt = time.Time{}
+	curPairAttempt.codeIssued = false
+	curPairAttempt.reported = true
+	curPairAttempt.mu.Unlock()
+}
+
+// elapsedFor 返回当前尝试已经过的毫秒数，以及是否已经出过码（纯函数，便于单测）。
+// 未出码用 startedAt；已出码用 codeIssuedAt —— 后者才是「码放了多久」。
+func elapsedFor(startedAt, codeIssuedAt time.Time, codeIssued bool, now time.Time) (int64, bool) {
+	base := startedAt
+	if codeIssued {
+		base = codeIssuedAt
+	}
+	if base.IsZero() {
+		return 0, codeIssued
+	}
+	ms := now.Sub(base).Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	return ms, codeIssued
+}
+
+func pairElapsed() (int64, bool) {
+	curPairAttempt.mu.Lock()
+	defer curPairAttempt.mu.Unlock()
+	return elapsedFor(curPairAttempt.startedAt, curPairAttempt.codeIssuedAt,
+		curPairAttempt.codeIssued, time.Now())
+}
+
+// emitPairError 输出一条结构化 pairError（一次尝试只发一条）。
+//
+// 🔴 `error` 字段必须保持与旧版**逐字一致**：老 Java 只按文本分类，
+// 且 Java 下发给 App 的 SSE 文案仍是 "pair error"。新增字段只是**追加**。
+func emitPairError(stage, reason, detail string, status int) {
+	curPairAttempt.mu.Lock()
+	if curPairAttempt.reported {
+		curPairAttempt.mu.Unlock()
+		return
+	}
+	curPairAttempt.reported = true
+	startedAt := curPairAttempt.startedAt
+	codeIssuedAt := curPairAttempt.codeIssuedAt
+	codeIssued := curPairAttempt.codeIssued
+	curPairAttempt.mu.Unlock()
+
+	elapsedMs, issued := elapsedFor(startedAt, codeIssuedAt, codeIssued, time.Now())
+	payload := map[string]any{
+		"error":       detail,
+		"stage":       stage,
+		"reason":      reason,
+		"elapsed_ms":  elapsedMs,
+		"code_issued": issued,
+	}
+	if status != 0 {
+		payload["status"] = status
+	}
+	ProtoOutput(MsgPairError, payload)
+}
+
+// pairFailureOf 把 events.PairError.Error 映射成结构化原因码 + status（纯函数，便于单测）。
+func pairFailureOf(err error) (string, int) {
+	switch {
+	case errors.Is(err, whatsmeow.ErrPairInvalidDeviceIdentityHMAC):
+		return "pair_hmac_mismatch", 401
+	case errors.Is(err, whatsmeow.ErrPairInvalidDeviceSignature):
+		return "pair_signature_mismatch", 401
+	}
+	var protoErr *whatsmeow.PairProtoError
+	if errors.As(err, &protoErr) {
+		return "pair_proto_error", 500
+	}
+	var dbErr *whatsmeow.PairDatabaseError
+	if errors.As(err, &dbErr) {
+		return "pair_db_error", 500
+	}
+	if errors.Is(err, whatsmeow.ErrPairRejectedLocally) {
+		return "pair_rejected_locally", 500
+	}
+	return "pair_completion_failed", 0
+}
 
 var enableViewOnce = false
 
@@ -497,13 +623,14 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Usage: pair-phone <number>")
 			return
 		}
+		beginPairAttempt()
 		if !cli.IsConnected() {
 			err := cli.Connect()
 			if err != nil {
 				log.Errorf("Failed to connect: %v", err)
 				// 连接失败也必须通知 Java（pairError → loginTimeout），否则 SSE 会一直挂起，
 				// 后续同手机号重试只会拿到缓存里的空 linkCode 而进入绑定页。
-				ProtoOutput(MsgPairError, map[string]any{"error": err.Error()})
+				emitPairError("pair_request", "connect_failed", err.Error(), 0)
 				return
 			}
 			log.Infof("Client is ready")
@@ -514,16 +641,20 @@ func handleCmd(cmd string, args []string) {
 		// 注意：这里的浏览器身份 ≠ DeviceProps.PlatformType（后者控制 view-once 等设备能力，独立于配对阶段）
 		linkingCode, err := cli.PairPhone(ctx, args[0], true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if err != nil {
-			ProtoOutput(MsgPairError, map[string]any{"error": err.Error()})
+			// reason 只标「请求阶段失败」，真正的细分原因在 error 原文里
+			// （info query returned status N / websocket not connected / ...），
+			// 由 Java 的 LinkFailureClassifier 按文本归并。
+			emitPairError("pair_request", "pair_request_failed", err.Error(), 0)
 			return
 		}
 		if linkingCode == "" {
 			// 兜底：即使 PairPhone 返回空 code，也不下发空串，按 pairError 处理
 			log.Errorf("PairPhone returned empty linking code")
-			ProtoOutput(MsgPairError, map[string]any{"error": "empty linking code"})
+			emitPairError("pair_request", "empty_code", "empty linking code", 0)
 			return
 		}
 		ProtoOutput(MsgLinkingCode, map[string]any{"code": linkingCode})
+		markPairCodeIssued()
 	case "require-qrcode":
 		if cli.IsConnected() {
 			log.Errorf("Already connected, can't start QR login")
@@ -1580,8 +1711,52 @@ func handler(rawEvt interface{}) {
 		// QR 流程不受影响：qrchan.go 在 QR 码耗尽时走 cli.Disconnect()（预期断开），不派发此事件。
 		if !cli.IsLoggedIn() {
 			log.Warnf("Disconnected during login phase (pairing code expired ~160s), notifying Java via pairError")
-			ProtoOutput(MsgPairError, map[string]any{"error": "pairing code expired (login websocket closed)"})
+			// 🔴 error 原文保持不变；是否「真过期」由 Java 按 code_issued + elapsed_ms 判定
+			// （出码后很快断开 = 网络掉线，不是过期）。
+			emitPairError("awaiting_code", "login_disconnected",
+				"pairing code expired (login websocket closed)", 0)
 		}
+
+	// ---- 配对 / 连接阶段的失败事件（Phase 2） ----------------------------------
+	// 🔴 这些事件**都不会**伴随 events.Disconnected：
+	//   · pair.go:141-146 在 handlePair 失败时先 cli.Disconnect() 再派发 PairError，
+	//     而 Disconnect() 内部 expectDisconnect() ⇒ connect() 不派发 Disconnected；
+	//   · handleConnectFailure 的默认分支同样先 expectDisconnect()。
+	// 所以不在这里单独处理，Java 就一条都收不到，只能等 5 分钟 emitter 超时。
+	case *events.PairSuccess:
+		// 配对成功：清掉尝试状态（不做任何通知；登录成功仍走 loginSuccess）。
+		endPairAttempt()
+	case *events.PairError:
+		if cli.IsLoggedIn() {
+			return
+		}
+		reason, status := pairFailureOf(evt.Error)
+		log.Warnf("PairError (%s/%d): %v", reason, status, evt.Error)
+		emitPairError("pair_complete", reason, evt.Error.Error(), status)
+	case *events.TemporaryBan:
+		if cli.IsLoggedIn() {
+			return
+		}
+		log.Warnf("TemporaryBan (code=%d, expire=%v)", int(evt.Code), evt.Expire)
+		emitPairError("connect", "temp_banned", evt.String(), int(evt.Code))
+	case *events.ClientOutdated:
+		if cli.IsLoggedIn() {
+			return
+		}
+		log.Warnf("ClientOutdated (405)")
+		emitPairError("connect", "client_outdated", "client version outdated", 405)
+	case *events.ConnectFailure:
+		if cli.IsLoggedIn() {
+			return
+		}
+		log.Warnf("ConnectFailure (reason=%d): %s", int(evt.Reason), evt.Message)
+		emitPairError("connect", "connect_failure", evt.Message, int(evt.Reason))
+	case *events.StreamError:
+		if cli.IsLoggedIn() {
+			return
+		}
+		log.Warnf("StreamError (code=%s)", evt.Code)
+		emitPairError("connect", "stream_error", evt.Code, 0)
 	case *events.PushNameSetting:
 		// Pushname changed mid-session: re-send presence to update server,
 		// notify Java of new nickname. Not a login event.
