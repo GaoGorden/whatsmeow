@@ -502,5 +502,9 @@ git commit -m "sync: merge upstream changes"
 8. **`mytest2` 是实验性**：多客户端 HTTP 版本尚在开发中，当前生产环境使用 `mytest`（单客户端 + Java Server 管理）
 9. **argo 目录**：包含自定义的 Argo 协议查询定义，嵌入了 `.argo` 和 `.json` 文件
 10. **跨仓库联动**：修改 Proto 消息格式或 Go↔Java 通信协议后，检查 `watracker-server/CLAUDE.md` 是否需要同步更新（根目录 CLAUDE.md 的「文档同步」规则）
-11. **history JSON 文件**：根目录有大量 `history-*.json` 文件，是 HistorySync 事件的调试输出，生产环境可忽略或清理
+11. **history JSON 文件（已停止生成，2026-10-27）**：原每次 `events.HistorySync` 都会把完整报文缩进写盘
+    （`history-<startupTime>-<seq>.json`，单文件 1–38 MB），**全仓库无任何读取方**，线上三台子节点累计
+    15.6 GB。现 `mytest/main.go` 的该分支只留一行 `log.Debugf` 摘要、不再落盘；存量由 Server 的
+    `DiskCleanupScheduler` 定时清理（`history-*.json` 保留 24h）。`mytest2` 的实验分支未同步。
+    详见 `doc/子服务器lshome磁盘清理与日志瘦身实施记录.md`
 12. ~~**`amazon.yaml` 包含 S3 密钥**~~：方案B 后 Go 不再嵌入/使用，S3 密钥集中在 Server 侧；旧密钥若曾随二进制/仓库分发建议在 AWS 轮换一次
