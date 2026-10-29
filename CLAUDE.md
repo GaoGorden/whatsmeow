@@ -174,6 +174,7 @@ Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一
 | `unsubscribepresence <jid>` | **协议退订 + 软退订双层**：① 协议退订（`UnsubscribePresence` 发 `<presence type=unsubscribe>`，whatsmeow 上游无此 API，**实测无效**——服务器不响应停推→重推语义，仅 best-effort）；② 软退订（移出重订阅集 + 标记过滤 + 清空 PresenceCache）。删除/改号 observer 时由 Server 下发 |
 | `checkuser <phones...>` | 检查号码是否注册 WhatsApp |
 | `querypresence` | 回吐每 JID 订阅状态 + presence 新鲜度快照（合并 `PresenceManager.Snapshot()` 与 `PresenceCache.Snapshot()`），经 `presenceStatus` proto 返回，供 Web 管理后台判断监听有效性。**Server 实际下发**（`ProcessUtils` 里有调用点）（2026-09-23 核对） |
+| `freeosmemory` | 手动触发一次 `debug.FreeOSMemory()`，打印前后 `HeapSys / HeapInuse / HeapIdle` 与 `HeapIdle` 减少量。**2026-10-29 新增，纯测量工具**：用于实测「不重启到底能还多少 RSS」，走 `debug` 通道（`debug freeosmemory`），**没有定时任务、Java 侧无调用点**。⚠️ 可回收上限 = `heap 区域驻留 − 活堆` ≈ 1.9 MB/进程（碎片化后更少），**不要把它当成容量方案**——见 `doc/ls_server2内存昨日今日差异归因与daemon判活修复方案.md` §五 |
 | `getavatar <jid>` | 获取头像 URL |
 | `getgroup <jid>` | 获取群组信息 |
 | `send <jid> <text>` | 发送文本消息 |

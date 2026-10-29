@@ -817,6 +817,25 @@ func handleCmd(cmd string, args []string) {
 			"count": len(items),
 			"items": items,
 		})
+	case "freeosmemory":
+		// 手动触发一次 debug.FreeOSMemory()，打印前后的堆指标 —— 用于**实测**「不重启能还回多少 RSS」。
+		// 这不是定时任务：每进程约 10~16MB 是与活跃数据无关的固定开销（二进制/immortal metadata/
+		// glibc+cgo arena），可回收的只有「heap 区域驻留 − 活堆」，线上实测上限约 1.9MB/进程，
+		// 碎片化后实际更少。详见 doc/ls_server2内存昨日今日差异归因与daemon判活修复方案.md §五。
+		// 用法：Web 端「Go 进程 → 调试控制台」执行 `freeosmemory`，或 `debug freeosmemory`。
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		debug.FreeOSMemory()
+		runtime.ReadMemStats(&after)
+		released := uint64(0)
+		if before.HeapIdle > after.HeapIdle { // 防无符号下溢（理论上 FreeOSMemory 只会归还，不会增长）
+			released = (before.HeapIdle - after.HeapIdle) >> 20
+		}
+		fmt.Printf("[freeosmemory] heapSys %d→%d MB, heapInuse %d→%d MB, heapIdle %d→%d MB, released %d MB\n",
+			before.HeapSys>>20, after.HeapSys>>20,
+			before.HeapInuse>>20, after.HeapInuse>>20,
+			before.HeapIdle>>20, after.HeapIdle>>20,
+			released)
 	//case "checkupdate":
 	//	resp, err := cli.CheckUpdate()
 	//	if err != nil {
