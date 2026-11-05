@@ -30,9 +30,10 @@
 | `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅；含退订标记集 `unsubscribedJIDs`，软退订 + 协议退订（`UnsubscribePresence`，**实测无效**，best-effort）双层；`Subscribe` 为**粘性订阅**——断线发送失败也记录 JID，重连后 `ResubscribeAll` 补发；`MarkPriority` **优先重订阅**重加 JID（ResubscribeAll 先发它，避免 map 随机顺序把重加 JID 排到最后拖慢恢复）；重加 observer 靠 2s 无推送强制重连兜底） |
 | `presence_cache.go` | **Presence 事件缓存与重放**：Java 掉线期间缓存上下线通知，重连后按序重放（含 `ts` 时间戳精确还原）；`Notify` 同时缓冲 view-once 等运行时通知；`Remove(jid)` 清空单 JID 缓存（软退订用）；`lastArrival`/`HasFreshEvent` 供重加订阅后 2s 无推送判定（触发强制重连兜底）。详见 `doc/Go端presence事件缓存与重放方案.md`、`doc/Server重启窗口Observer操作与presence重放风险修复.md` |
 | `status.go` | **Status（动态）采集主体**（2026-09-22 新增）：`handleStatusMessage` = 过滤链（总开关 / `IsFromMe` / 纯 SKDM / `ProtocolMessage`(REVOKE) / 号码过滤集 / LRU 去重）→ 类型分派（image/video/audio 走下载上传；**纯文本直接丢弃**，2026-09-28）→ worker 池（并发 2）→ outbox。含 `statusObserverSet`（全量覆盖 `replace`）、`statusSeenSet`（5000 条环形去重）、`normalizeStatusJid`、`statusObjectKey`、磁盘水位暂停。详见 `doc/Status动态追踪_Go端实施记录.md`、方案 `doc/Status动态追踪功能实现方案.md` |
+| `recover.go` | **消息恢复（Recover）采集主体**（2026-11-05 新增）：`handleRecoverMessage` 先分流 `RawMessage` 的 `REVOKE` / `MESSAGE_EDIT`（**必须在通用 `receivedMessage` 之前 return**，否则编辑会被规范化成「原消息 ID + 新内容」覆盖原文），再对普通/视图一次消息按 `recoverClassify` 入队。**全部一对一单聊**采集（群聊 / `status@broadcast` / newsletter 跳过；自己发的不采）。worker=1、队列 256、LRU 去重、`recover-outbox/{ackId}.json` + `recoverack`。ackId = `messageId\|eventType\|eventAt`（同一消息可能有 edit/revoke 多个事件，不能按 messageId ack）。媒体不设上限，只受磁盘水位约束。单测 `recover_test.go` |
 | `diskfree_linux.go` / `diskfree_other.go` | `statusFreeDiskBytes(path)` 平台分叉（`syscall.Statfs`）。**非 Linux 返回 `ok=false`** → 磁盘水位保护只在生产生效，本地 Windows 联调不会被暂停逻辑卡住（对照 `proc_mem_linux.go` / `proc_mem_other.go`） |
 | `status_test.go` | Status 单测 9 个（过滤链早退、去重集淘汰、outbox 生命周期/裁剪、payload 字段表）。`statusMaxFileBytes` / `statusOutboxMax` 写成 `var` 就是为了单测能调小 |
-| `pending_upload.go` | **View-once 完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，attach/周期触发重传 + 补通知，上限 **100 条 + 2GiB**（双上限，任一超标按 mtime 丢最旧）。**2026-09-22 流式改造**：下载走 `downloadToTemp`（`cli.DownloadToFile` 落临时文件）、上传走 `uploadFileToS3`、暂存走 `moveFile`（rename 优先），全链路内存 O(32KB) 与文件大小无关。详见 `doc/pending-upload流式改造实施记录.md`、`doc/Go进程内存优化与预签名上传方案.md`「完整恢复」。**同批新增 `Source` 判别字段**：`flushPendingUploads` 按 `meta.Source == "status"` 分流到 `flushPendingStatus`——Status 复用这套暂存目录，就同时复用了条数/字节双上限、rename 搬移与 attach/周期两条重传触发路径；`Source` 为空（含历史遗留记录）走原 view-once 路径。`flushPendingStatus` 用记录里**存下的 `ObjectKey`**（不重新推导，否则重传会落到与 DB 不同的键上） |
+| `pending_upload.go` | **View-once 完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，attach/周期触发重传 + 补通知，上限 **100 条 + 2GiB**（双上限，任一超标按 mtime 丢最旧）。**2026-09-22 流式改造**：下载走 `downloadToTemp`（`cli.DownloadToFile` 落临时文件）、上传走 `uploadFileToS3`、暂存走 `moveFile`（rename 优先），全链路内存 O(32KB) 与文件大小无关。详见 `doc/pending-upload流式改造实施记录.md`、`doc/Go进程内存优化与预签名上传方案.md`「完整恢复」。**同批新增 `Source` 判别字段**：`flushPendingUploads` 按 `meta.Source == "status"` 分流到 `flushPendingStatus`——Status 复用这套暂存目录，就同时复用了条数/字节双上限、rename 搬移与 attach/周期两条重传触发路径；`Source` 为空（含历史遗留记录）走原 view-once 路径。`flushPendingStatus` 用记录里**存下的 `ObjectKey`**（不重新推导，否则重传会落到与 DB 不同的键上）。**2026-11-05 新增 `Source=recover`**：`flushPendingRecover` 走同一套暂存/重传，成功后发 `recoverMessage` |
 | `main_new.go` | 原始上游示例代码（函数名改为 `maingg()`，不执行） |
 | `go.mod` | 独立 Go module，通过 `replace` 指向本地 whatsmeow 库 |
 | `amazon.yaml` | ⚠️ **已废弃**：原 S3 凭证嵌入文件，方案B 后 Go 不再嵌入/引用（可删除，密钥改由 Server 侧 S3Config 统一持有） |
@@ -186,6 +187,9 @@ Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一
 | `syncstatusobservers <jid...>` | **全量覆盖** Status 过滤集合（`statusObservers.replace`，**空集合 = 清空**）。Java 侧刻意只提供全量、不做增量：增量漏一次会静默地让集合与服务器侧不一致（表现为「某些联系人永远收不到动态」且不报错） |
 | `addstatusobserver <jid>` / `removestatusobserver <jid>` | 增/删单个成员。**Java 侧无调用点**，留作 Web 调试控制台的调试命令；业务路径一律走 `syncstatusobservers` 全量覆盖 |
 | `statusack <statusId>` | Server 确认某条 Status 已终态落库（或被唯一键判为重复 / 毒报文 / 刻意丢弃）→ Go 删除对应 `status-outbox/{statusId}.json`。**不 ack 的场景只有 `subUser == null`**（用户释放路径上的瞬态，宁重勿丢） |
+| `enable-recover` | 开启消息恢复采集（`recoverEnabled`，atomic.Bool）。**只在用户点过开始 + 有激活订单 + 已登录时**由 Java 显式下发；不要在连接建立时自动打开（与 `enable-view-once` 不同） |
+| `disable-recover` | 关闭采集。**只停采集，不删 outbox/已采数据**；订阅过期只发这一条、不清 `recover_started` |
+| `recoverack <ackId>` | Server 确认某条 `recoverMessage` 已终态落库 → 删除 `recover-outbox/{ackId}.json`。`ackId = messageId\|eventType\|eventAt`，**不能用 messageId**（同一消息可能有 edit/revoke 多个事件） |
 | `debug <cmd> [args...]` | 调试包装器：把任意子命令重定向 stdout 后执行（20s 超时），连同期间捕获的 proto 一并经 `debugResult` proto 回吐（output 截断至末 100KB）。**Server 实际下发**（Web 调试控制台链路）（2026-09-23 核对） |
 
 ### 6. Status（动态）采集
@@ -253,6 +257,44 @@ outbox 的三个触发点：① 写入在 `publishStatus` 里**先落盘再 Noti
 **对象键**：`whatsapp/status/{userJID}/{observerJid}/{statusId}{ext}`，**前缀必须是 `whatsapp/status/`**，
 否则 Server 的 `/inner/presignStatusUpload` 直接 400（对照 ViewOnce 的 `whatsapp/view-once/`）。
 扩展名走显式 mime→ext 表 `statusMediaExt`（**不用 `mimetype` 库**），以保证首次上传与重传算出**同一个键**。
+
+### 7. 消息恢复（Recover）采集（2026-11-05）
+
+入口 `recover.go`，与 Status 的成熟件（worker/背压/LRU/磁盘水位/outbox/pending-upload）同构，
+但有四个关键差异：
+
+1. **范围是全量一对一单聊**，不按 observer 过滤；群聊、`status@broadcast`、newsletter 跳过，
+   自己发的不采。`chatId` 用 `searchPhoneNum` 解析（失败才退回 JID 的 user 部分）。
+2. **必须先处理 `ProtocolMessage`**：`REVOKE` 取 `Key.ID`、`MESSAGE_EDIT` 取 `Key.ID` + `EditedMessage`，
+   分别发 `eventType=revoke/edit` 并 **return true** 让上层直接返回。若落到通用
+   `receivedMessage`，whatsmeow 已把编辑规范化成「原消息 ID + 新内容」，原文会被静默覆盖。
+   🔴 **还有第二种编辑形态 `EditedMessage` 包裹（2026-11-05 联调补）**：`UnwrapRaw()` 会把
+   `evt.Message` 解到编辑后的内容并置 **`evt.IsEdit=true`**，此时 **`RawMessage` 里没有
+   `ProtocolMessage`**，上面那个分支抓不到。必须在 `SecretEncryptedMessage` 检查之后补
+   `if evt.IsEdit { ... eventType=edit ... return true }`，否则会落到 normal 分支 →
+   Server 写 `status='buffered'` → **编辑消息永远不出现在列表**。两种形态互斥，
+   不要漏掉任意一种；`recover_test.go` 应覆盖 `recoverEditedTextAndKind` 的文本/媒体分支。
+   🔴 **第三种（本地实测命中的就是它）：`SecretEncryptedMessage` + `MESSAGE_EDIT`**。
+   WhatsApp 新版客户端把编辑加密在 `SecretEncryptedMessage` 里（`secretEncType=MESSAGE_EDIT`，
+   `targetMessageKey.id` = 原消息 ID）。必须调 `cli.DecryptSecretEncryptedMessage(ctx, evt)`
+   解密后再发 `eventType=edit`，**不能只打 WARN 放行**——放行会落成 normal buffered，列表不可见。
+   解密依赖原消息的 message secret（`storeMessageSecret` 在收原消息/HistorySync 时落库）；
+   secret 缺失时只 WARN 并消费掉，不要退化成 normal。
+3. **普通消息只进缓冲**：Go 照常上报 `eventType=normal`，Java 写 `status='buffered'`（3 天不可见）；
+   只有撤回/编辑/view-once 才升级为 `permanent` 出现在 App 列表。
+4. **媒体不设上限**（产品定案）：只受磁盘水位（200MB）与队列背压约束；worker=1（全量单聊比
+   Status 重得多，4GiB 节点上 2 个并发不可控）。
+
+其它：
+- 去重 LRU 键是 `ackId`（`messageId|eventType|eventAt`）；outbox 也以 `ackId` 为文件名。
+- 对象键 `recover/{userJID}/{messageID}{ext}`，必须匹配 Server `/inner/presignRecoverUpload`
+  的 `recover/` 前缀校验。
+- `pending-upload` 新增 `Source=recover` 分支；复用 `ObserverId`(chatId) / `PushName`(chatName) /
+  `FileName`(messageId) / `ObjectKey` / `MiniType` / `FileLength` / `Seconds` / `PostedAt`，
+  另加 `RecoverAckID/EventType/Kind/Text/FileName/EventAt`。
+- 心跳追加 `recover_enabled` / `recover_pending` / `recover_dropped` / `recover_queue`。
+- **部署顺序 Server 先于 Go**：新 Go 配旧 Server 会因收不到 `recoverack` 让 outbox 涨到上限。
+- 单测 `recover_test.go` 覆盖分类、编辑文本、view-once 判定、ackId 唯一性、扩展名推导。
 
 ## 库层目录结构（上游 + 定制）
 
@@ -361,6 +403,7 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 | `MsgViewOnceEnabled` | `viewOnceEnabled` | ViewOnce 开关确认 |
 | `MsgPairError` | `pairError` | 配对错误。**Phase 2（2026-10-23）新增结构化字段**：`stage`(`pair_request`/`awaiting_code`/`pair_complete`/`connect`) / `reason`（机器码，如 `pair_hmac_mismatch`、`temp_banned`、`login_disconnected`）/ `status`（HTTP/IQ status 或 ban code 101–106，0 时不发）/ `elapsed_ms`（已出码按出码时刻算，未出码按 `pair-phone` 开始算）/ `code_issued`。🔴 `error` 原文逐字不变（老 Java 只按文本分类；下发给 App 的 SSE 文案仍是 `"pair error"`） |
 | `MsgStatusFile` | `statusFile` | **Status（动态）条目上报**（2026-09-22 新增）：`statusId` / `observerId` / `pushName` / `kind`(text·image·video·audio) / `miniType` / `fileLength` / `seconds` / `text`（文案，产品要求保存）/ `objectKey` / `thumbKey` / `postedAt`。⚠️ **必须走 `PresenceCache.Notify`，不得裸 `ProtoOutput`**——裸输出拿不到掉线缓冲，Java 掉线期间会直接丢。⚠️ `kind` 为媒体但 `objectKey` 为空 = 该条媒体不可用（超 100MB 只报元数据，或磁盘水位降级），App 侧据此渲染 |
+| `MsgRecoverMessage` | `recoverMessage` | **消息恢复事件上报**（2026-11-05 新增）：`ackId` / `messageId` / `chatId` / `chatName` / `senderJid` / `eventType`(normal·revoke·edit·view_once) / `kind` / `text` / `originalText` / `objectKey` / `mime` / `size` / `seconds` / `fileName` / `mediaSkipped` / `postedAt` / `eventAt`。⚠️ 必须走 `PresenceCache.Notify` + `recover-outbox/`；ack 用 `ackId` 而非 messageId |
 | `MsgHeartbeat` | `heartbeat` | 进程心跳（60s 间隔） |
 | `MsgResubscribe` | `resubscribe` | 重连后重订阅结果 |
 | `MsgStreamReplaced` | `streamReplaced` | 被顶号（其他设备登录） |

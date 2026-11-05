@@ -375,6 +375,12 @@ func main() {
 				"status_pending":   statusOutboxCount(),
 				"status_dropped":   statusDropped.Load(),
 				"status_queue":     len(statusQueue),
+				// Recover 采集可观测指标：pending 长期不降 = Java 没在 ack；
+				// dropped > 0 = 有恢复事件被背压/outbox 溢出丢失。
+				"recover_enabled": recoverEnabled.Load(),
+				"recover_pending": recoverOutboxCount(),
+				"recover_dropped": recoverDropped.Load(),
+				"recover_queue":   len(recoverQueue),
 			})
 		}
 	}()
@@ -388,12 +394,16 @@ func main() {
 			if HasJavaClient() {
 				flushPendingUploads()
 				replayStatusOutbox()
+				replayRecoverOutbox()
 			}
 		}
 	}()
 
 	// Status（动态）采集 worker：并发上限即 worker 数（方案 §3.7 的信号量口径）
 	startStatusWorkers()
+
+	// 消息恢复 worker：全量单聊 + 全量媒体，刻意只开 1 个并发（4GiB 节点上 2 个不可控）
+	startRecoverWorkers()
 
 	cli.AddEventHandler(handler)
 	if device.ID != nil {
@@ -511,6 +521,7 @@ func startCommandSocket(input chan<- string, sockPath string) {
 				// 通知，outbox 兜的是「进程重启」那部分（内存缓冲已丢）——顺序反了不会出错，
 				// 但会让日志看不出真实的重放量。
 				go replayStatusOutbox()
+				go replayRecoverOutbox()
 				log.Infof("Java client attached from %s", conn.RemoteAddr())
 			} else if readErr == nil && len(first) > 0 {
 				log.Debugf("command-only connection: %s", first)
@@ -618,6 +629,20 @@ func handleCmd(cmd string, args []string) {
 	case "disable-view-once":
 		enableViewOnce = false
 		ProtoOutput(MsgViewOnceEnabled, map[string]any{"enabled": false})
+	case "enable-recover":
+		// 与 enable-view-once 不同：这是「用户点过开始 + 有激活订单」后由 Java 显式下发，
+		// 不要在连接建立时自动打开。
+		recoverEnabled.Store(true)
+		log.Infof("Recover enabled")
+	case "disable-recover":
+		// 只停采集，不删 outbox/已采数据（数据生命周期由 Java 的清理任务负责）
+		recoverEnabled.Store(false)
+		log.Infof("Recover disabled")
+	case "recoverack":
+		// Java 落库成功后回执：args[0] 是 ackId（messageId|eventType|eventAt）
+		if len(args) >= 1 {
+			recoverOutboxAck(args[0])
+		}
 	case "pair-phone":
 		if len(args) < 1 {
 			log.Errorf("Usage: pair-phone <number>")
@@ -1811,6 +1836,12 @@ func handler(rawEvt interface{}) {
 			handleStatusMessage(evt)
 			return
 		}
+		// 消息恢复：REVOKE / MESSAGE_EDIT 必须在这里消费并 return（否则编辑会被规范化成
+		// 「原消息 ID + 新内容」当普通消息上报，原文被静默覆盖）；普通/view-once 只是入队，
+		// 返回 false，继续走下面的通用 receivedMessage（在线活动推断仍需要）。
+		if handleRecoverMessage(evt) {
+			return
+		}
 		metaParts := []string{fmt.Sprintf("pushname: %s", evt.Info.PushName), fmt.Sprintf("timestamp: %s", evt.Info.Timestamp)}
 		if evt.Info.Type != "" {
 			metaParts = append(metaParts, fmt.Sprintf("type: %s", evt.Info.Type))
@@ -1885,7 +1916,11 @@ func handler(rawEvt interface{}) {
 		//	fmt.Printf("头像下载链接: %s\n", imgInfo.URL)
 		//}
 
-		if enableViewOnce && evt.Info.Sender.String() != lid {
+		// 一期不处理群聊消息（2026-11-04 定案）：群消息的 Sender 是单个成员，
+		// 直接按 Sender 归档会把群内容错记到该成员的个人名下（见 doc 预研 §1.2）。
+		// 后续要做群聊时，必须同时引入 chatJid / senderJid，并在撤回时用
+		// ProtocolMessage.Key.Participant 定位原作者，不能沿用这里的归属方式。
+		if enableViewOnce && !evt.Info.IsGroup && evt.Info.Sender.String() != lid {
 			img := evt.Message.GetImageMessage()
 			if img != nil && img.GetViewOnce() {
 				observerId := searchPhoneNum(ctx, evt.Info.Sender)
@@ -2115,6 +2150,8 @@ func uploadAndNotify(observerId string, pushName string, fileName string, srcPat
 	presenceCache.Notify(MsgViewOnceFile, map[string]any{
 		"observerId": observerId,
 		"pushName":   pushName,
+		// msgId: WhatsApp 消息 ID（fileName 就是 evt.Info.ID）。Java 侧用它做幂等与撤回关联。
+		"msgId":      fileName,
 		"miniType":   miniType,
 		"fileLength": fileLength,
 		"seconds":    seconds,

@@ -35,6 +35,10 @@ const (
 	// 不要裸 ProtoOutput —— 它拿不到缓冲，Java 掉线期间会直接丢。
 	MsgStatusFile = "statusFile"
 
+	// MsgRecoverMessage: 消息恢复事件上报（normal / revoke / edit / view_once）。
+	// 同样必须走 PresenceCache.Notify + 磁盘 outbox。
+	MsgRecoverMessage = "recoverMessage"
+
 	// Stability monitoring messages
 	MsgHeartbeat      = "heartbeat"      // Periodic health report (goroutines, memory, subscribers)
 	MsgResubscribe    = "resubscribe"    // Result of auto-resubscribe after reconnect

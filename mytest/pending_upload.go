@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +35,9 @@ var uploadFlushMu sync.Mutex
 // pendingSourceStatus 标记一条暂存记录来自 Status 动态（Source 为空 = view-once，兼容旧记录）。
 const pendingSourceStatus = "status"
 
+// pendingSourceRecover 标记一条暂存记录来自「消息恢复」。
+const pendingSourceRecover = "recover"
+
 // pendingUploadMeta 是暂存媒体的元数据（pending-upload/{base}.json；{base}.bin 为原始媒体字节）。
 //
 // Source 之后的字段是 **Status 动态专用**：view-once 生成的记录没有这些字段，反序列化后为空，
@@ -56,6 +60,17 @@ type pendingUploadMeta struct {
 	ObjectKey string `json:"objectKey,omitempty"`
 	ThumbKey  string `json:"thumbKey,omitempty"`
 	PostedAt  int64  `json:"postedAt,omitempty"`
+
+	// ---- Recover 专用 ----
+	// ObserverId/PushName/FileName/FileLength/Seconds/MiniType/ObjectKey/PostedAt 复用上面的字段：
+	// 它们语义一致（chatId / chatName / messageId / 大小 / 时长 / MIME / 对象键 / 原消息时刻）。
+	RecoverAckID        string `json:"recoverAckId,omitempty"`
+	RecoverEventType    string `json:"recoverEventType,omitempty"`
+	RecoverKind         string `json:"recoverKind,omitempty"`
+	RecoverText         string `json:"recoverText,omitempty"`
+	RecoverFileName     string `json:"recoverFileName,omitempty"`
+	RecoverEventAt      int64  `json:"recoverEventAt,omitempty"`
+	RecoverMediaSkipped bool   `json:"recoverMediaSkipped,omitempty"`
 }
 
 // savePendingUpload 将上传失败（如 Java 掉线导致预签名申请失败）的 view-once 媒体暂存到本地。
@@ -130,7 +145,17 @@ func moveFile(src, dst string) error {
 
 // sanitizeFileName 将消息 ID 等名称清理为安全的文件名（防路径穿越/非法字符）。
 func sanitizeFileName(name string) string {
-	s := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(name)
+	// Windows 不允许文件名含 | * ? " < >；Recover 的 ackId 是 `messageId|eventType|eventAt`，
+	// 只替换 / \ : 会让 `recover-outbox/<ackId>.json` 在本地 Windows 联调时写入失败
+	// （2026-11-05 实测：outbox write failed / ack failed）。
+	// ⚠️ **只在 Windows 上替换**：Linux 生产已有以 `|` 命名的 outbox 文件，若这里一并替换，
+	// 部署后 ack 会找不到旧文件、导致旧条目被无限重放。
+	replacer := []string{"/", "_", "\\", "_", ":", "_"}
+	if runtime.GOOS == "windows" {
+		replacer = append(replacer,
+			"|", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_")
+	}
+	s := strings.NewReplacer(replacer...).Replace(name)
 	s = strings.Map(func(r rune) rune {
 		if r < 32 || r == 127 {
 			return '_'
@@ -198,6 +223,10 @@ func flushPendingUploads() {
 			flushPendingStatus(meta, p)
 			continue
 		}
+		if meta.Source == pendingSourceRecover {
+			flushPendingRecover(meta, p)
+			continue
+		}
 		// 流式上传：不再把整份媒体读进堆（100MB 视频 = 一次性 100MB+ 峰值分配）
 		mType, err := mimetype.DetectFile(p.bin)
 		if err != nil {
@@ -213,6 +242,8 @@ func flushPendingUploads() {
 		presenceCache.Notify(MsgViewOnceFile, map[string]any{
 			"observerId": meta.ObserverId,
 			"pushName":   meta.PushName,
+			// msgId: FileName 存的就是原消息 ID；重传时同样要带上，否则 Java 只能从 objectKey 兜底解析。
+			"msgId":      meta.FileName,
 			"miniType":   miniType,
 			"fileLength": meta.FileLength,
 			"seconds":    meta.Seconds,
@@ -245,6 +276,52 @@ func flushPendingStatus(meta pendingUploadMeta, p pendingPair) {
 	_ = os.Remove(p.json)
 	_ = os.Remove(p.bin)
 	log.Infof("status pending %s replayed to Java (objectKey %s)", p.base, meta.ObjectKey)
+}
+
+// flushPendingRecover 重传一条暂存的 Recover 媒体。
+// 对象键直接取记录里存下的 ObjectKey（首次上传失败前已算好），保证重传与首次落在同一个键。
+func flushPendingRecover(meta pendingUploadMeta, p pendingPair) {
+	if meta.ObjectKey == "" {
+		log.Errorf("recover pending %s has empty objectKey, dropping", p.base)
+		_ = os.Remove(p.json)
+		_ = os.Remove(p.bin)
+		return
+	}
+	if err := uploadFileToS3(presignRecoverUploadPath, meta.ObjectKey, p.bin, meta.MiniType, recoverUploadTimeout); err != nil {
+		log.Warnf("recover pending %s retry upload failed (%v), keep for next retry", p.base, err)
+		return
+	}
+	publishRecover(recoverPayloadFromPending(meta, meta.ObjectKey))
+	_ = os.Remove(p.json)
+	_ = os.Remove(p.bin)
+	log.Infof("recover pending %s replayed to Java (objectKey %s)", p.base, meta.ObjectKey)
+}
+
+// recoverPayloadFromPending 用暂存元数据重建 recoverMessage 载荷（重传成功后调用）。
+func recoverPayloadFromPending(meta pendingUploadMeta, objectKey string) map[string]any {
+	ackID := meta.RecoverAckID
+	if ackID == "" {
+		ackID = recoverAckID(meta.FileName, meta.RecoverEventType, meta.RecoverEventAt)
+	}
+	return map[string]any{
+		"ackId":        ackID,
+		"messageId":    meta.FileName,
+		"chatId":       meta.ObserverId,
+		"chatName":     meta.PushName,
+		"senderJid":    "",
+		"eventType":    meta.RecoverEventType,
+		"kind":         meta.RecoverKind,
+		"text":         meta.RecoverText,
+		"originalText": "",
+		"objectKey":    objectKey,
+		"mime":         meta.MiniType,
+		"size":         meta.FileLength,
+		"seconds":      meta.Seconds,
+		"fileName":     meta.RecoverFileName,
+		"mediaSkipped": meta.RecoverMediaSkipped,
+		"postedAt":     meta.PostedAt,
+		"eventAt":      meta.RecoverEventAt,
+	}
 }
 
 // mediaTmpStaleAfter: media-tmp 下超过该年龄的文件视为「进程崩在下载中途」的遗留物，直接清掉。
