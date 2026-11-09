@@ -129,6 +129,7 @@ func handleRecoverMessage(evt *events.Message) bool {
 			originalID := pm.GetKey().GetID()
 			if originalID != "" {
 				text, kind := recoverEditedTextAndKind(pm.GetEditedMessage())
+				logRecoverEdit("protocol", originalID, kind, text)
 				ackID := recoverAckID(originalID, "edit", eventAt)
 				if recoverSeen.mark(ackID) {
 					publishRecover(map[string]any{
@@ -184,6 +185,7 @@ func handleRecoverMessage(evt *events.Message) bool {
 			return true
 		}
 		text, kind := recoverEditedTextAndKind(decrypted)
+		logRecoverEdit("secret", targetID, kind, text)
 		if text == "" && kind == "unknown" {
 			// 只打结构、不打内容：若仍出现，说明解密后的 payload 还有未覆盖的包装。
 			log.Warnf("recover: secret edit content unknown (message %s, target %s): "+
@@ -221,6 +223,7 @@ func handleRecoverMessage(evt *events.Message) bool {
 	if evt.IsEdit {
 		if evt.Info.ID != "" {
 			text, kind := recoverEditedTextAndKind(evt.Message)
+			logRecoverEdit("isEdit", evt.Info.ID, kind, text)
 			if text == "" && kind == "unknown" {
 				log.Warnf("recover: IsEdit content unknown (message %s)", evt.Info.ID)
 			}
@@ -362,6 +365,17 @@ func recoverClassify(m *waE2E.Message) (string, whatsmeow.DownloadableMessage, s
 // 2026-11-05 实测 `SecretEncryptedMessage(MESSAGE_EDIT)` 解密后的 payload 就不是
 // 直接的 Conversation，必须逐层解开，否则会返回 `("", "unknown")`，
 // Server 把 text_content 覆盖成空串，列表摘要变空白。
+// logRecoverEdit 打一条编辑事件摘要（三个分支共用）。
+//
+// 只打**长度**不打正文：正文属于用户隐私，日志里有长度+kind 就足以判断
+// 「是解析失败（len=0 + kind=unknown）还是正常取到」。
+// 排查「编辑没有推送」时，这三条 INFO 与 Server 的 `edit applied` / `edit redelivered`
+// 是同一事件在两端的一对锚点。
+func logRecoverEdit(form, targetID, kind, text string) {
+	log.Infof("recover: edit event form=%s target=%s kind=%s textLen=%d",
+		form, targetID, kind, len(text))
+}
+
 func recoverEditedTextAndKind(m *waE2E.Message) (string, string) {
 	m = recoverUnwrapMessage(m)
 	if m == nil {
