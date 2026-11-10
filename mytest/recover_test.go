@@ -149,3 +149,26 @@ func TestRecoverExt(t *testing.T) {
 		}
 	}
 }
+
+// 单文件磁盘保护：最多占用一半剩余空间；大小未知/磁盘不可探测时放行。
+func TestMediaFitsDisk(t *testing.T) {
+	cases := []struct {
+		name string
+		free uint64
+		ok   bool
+		size uint64
+		want bool
+	}{
+		{"unknown size passes", 1000, true, 0, true},
+		{"undetectable disk passes", 0, false, 1 << 30, true},
+		{"exactly half passes", 1000, true, 500, true},
+		{"over half rejected", 1000, true, 501, false},
+		{"empty disk rejects any file", 0, true, 1, false},
+	}
+	for _, tc := range cases {
+		if got := mediaFitsDisk(tc.free, tc.ok, tc.size); got != tc.want {
+			t.Fatalf("%s: mediaFitsDisk(%d, %v, %d) = %v, want %v",
+				tc.name, tc.free, tc.ok, tc.size, got, tc.want)
+		}
+	}
+}

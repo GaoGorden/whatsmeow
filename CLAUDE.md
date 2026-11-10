@@ -33,7 +33,7 @@
 | `recover.go` | **消息恢复（Recover）采集主体**（2026-11-05 新增）：`handleRecoverMessage` 先分流 `RawMessage` 的 `REVOKE` / `MESSAGE_EDIT`（**必须在通用 `receivedMessage` 之前 return**，否则编辑会被规范化成「原消息 ID + 新内容」覆盖原文），再对普通/视图一次消息按 `recoverClassify` 入队。**全部一对一单聊**采集（群聊 / `status@broadcast` / newsletter 跳过；自己发的不采）。worker=1、队列 256、LRU 去重、`recover-outbox/{ackId}.json` + `recoverack`。ackId = `messageId\|eventType\|eventAt`（同一消息可能有 edit/revoke 多个事件，不能按 messageId ack）。媒体不设上限，只受磁盘水位约束。单测 `recover_test.go` |
 | `diskfree_linux.go` / `diskfree_other.go` | `statusFreeDiskBytes(path)` 平台分叉（`syscall.Statfs`）。**非 Linux 返回 `ok=false`** → 磁盘水位保护只在生产生效，本地 Windows 联调不会被暂停逻辑卡住（对照 `proc_mem_linux.go` / `proc_mem_other.go`） |
 | `status_test.go` | Status 单测 9 个（过滤链早退、去重集淘汰、outbox 生命周期/裁剪、payload 字段表）。`statusMaxFileBytes` / `statusOutboxMax` 写成 `var` 就是为了单测能调小 |
-| `pending_upload.go` | **View-once 完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，attach/周期触发重传 + 补通知，上限 **100 条 + 2GiB**（双上限，任一超标按 mtime 丢最旧）。**2026-09-22 流式改造**：下载走 `downloadToTemp`（`cli.DownloadToFile` 落临时文件）、上传走 `uploadFileToS3`、暂存走 `moveFile`（rename 优先），全链路内存 O(32KB) 与文件大小无关。详见 `doc/pending-upload流式改造实施记录.md`、`doc/Go进程内存优化与预签名上传方案.md`「完整恢复」。**同批新增 `Source` 判别字段**：`flushPendingUploads` 按 `meta.Source == "status"` 分流到 `flushPendingStatus`——Status 复用这套暂存目录，就同时复用了条数/字节双上限、rename 搬移与 attach/周期两条重传触发路径；`Source` 为空（含历史遗留记录）走原 view-once 路径。`flushPendingStatus` 用记录里**存下的 `ObjectKey`**（不重新推导，否则重传会落到与 DB 不同的键上）。**2026-11-05 新增 `Source=recover`**：`flushPendingRecover` 走同一套暂存/重传，成功后发 `recoverMessage` |
+| `pending_upload.go` | **View-once 完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，attach/周期触发重传 + 补通知，上限 **100 条 + 2GiB**（双上限，任一超标触发裁剪）。🔴 **2026-11-10 起淘汰按优先级而非纯 mtime**：`recover 缓冲消息 < recover 永久事件 < status < view-once`（同级内仍按 mtime 丢最旧）——Recover 的媒体量远大于另外两个功能，只按时间淘汰会把正在等补传的 ViewOnce 挤掉（永久丢失）。元数据损坏的记录按最低优先级最先丢弃。**2026-09-22 流式改造**：下载走 `downloadToTemp`（`cli.DownloadToFile` 落临时文件）、上传走 `uploadFileToS3`、暂存走 `moveFile`（rename 优先），全链路内存 O(32KB) 与文件大小无关。详见 `doc/pending-upload流式改造实施记录.md`、`doc/Go进程内存优化与预签名上传方案.md`「完整恢复」。**同批新增 `Source` 判别字段**：`flushPendingUploads` 按 `meta.Source == "status"` 分流到 `flushPendingStatus`——Status 复用这套暂存目录，就同时复用了条数/字节双上限、rename 搬移与 attach/周期两条重传触发路径；`Source` 为空（含历史遗留记录）走原 view-once 路径。`flushPendingStatus` 用记录里**存下的 `ObjectKey`**（不重新推导，否则重传会落到与 DB 不同的键上）。**2026-11-05 新增 `Source=recover`**：`flushPendingRecover` 走同一套暂存/重传，成功后发 `recoverMessage` |
 | `main_new.go` | 原始上游示例代码（函数名改为 `maingg()`，不执行） |
 | `go.mod` | 独立 Go module，通过 `replace` 指向本地 whatsmeow 库 |
 | `amazon.yaml` | ⚠️ **已废弃**：原 S3 凭证嵌入文件，方案B 后 Go 不再嵌入/引用（可删除，密钥改由 Server 侧 S3Config 统一持有） |
@@ -284,8 +284,16 @@ outbox 的三个触发点：① 写入在 `publishStatus` 里**先落盘再 Noti
    只有撤回/编辑/view-once 才升级为 `permanent` 出现在 App 列表。
 4. **媒体不设上限**（产品定案）：只受磁盘水位（200MB）与队列背压约束；worker=1（全量单聊比
    Status 重得多，4GiB 节点上 2 个并发不可控）。
+   🆕 **2026-11-10 加单文件磁盘保护**：下载前校验「文件大小 ≤ 剩余空间 / 2」，超出则
+   `mediaSkipped=true` 只上报元数据（`processRecoverJob` → `mediaFitsDisk`）。原有水位只保证
+   「开始下载时还有 200MB+」，两个用户进程并发下载大视频仍可叠加穿透。
 
 其它：
+- 🔴 **`chatName` 必须取「WhatsApp 列表显示的名字」**（2026-11-10）：`recoverChatName` 先查
+  contact store（`getNickName` → 通讯录名 `FullName`，没有才用对方 `PushName`），
+  **不能**只用 `evt.Info.PushName`（那只有对方自设名，对已保存/改过备注的联系人会与
+  WhatsApp 显示不一致 —— 测试三轮：App 列表报 `GG`、WhatsApp 报 `GG啊啊啊`）。
+  单次调用是一次本地 SQLite 查询，不要为省这点开销退回旧逻辑。
 - 去重 LRU 键是 `ackId`（`messageId|eventType|eventAt`）；outbox 也以 `ackId` 为文件名。
 - 对象键 `recover/{userJID}/{messageID}{ext}`，必须匹配 Server `/inner/presignRecoverUpload`
   的 `recover/` 前缀校验。

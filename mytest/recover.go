@@ -446,11 +446,14 @@ func recoverChatID(ctx context.Context, evt *events.Message) string {
 }
 
 func recoverChatName(ctx context.Context, evt *events.Message) string {
-	// 先取事件自带的 push name（零成本），为空才去查通讯录/昵称表。
-	// 全量单聊下每条消息都查一次 getNickName 会明显放大开销。
-	name := evt.Info.PushName
+	// 🔴 优先查 contact store（FullName = 手机通讯录里的名字，没有才用对方的 push name），
+	// 这正是 **WhatsApp 聊天列表显示的名字**；`evt.Info.PushName` 只有 push name，
+	// 对「已保存/改过备注」的联系人会与 WhatsApp 显示不一致（2026-11-10 三轮测试反馈：
+	// 列表报 GG、WhatsApp 报 GG啊啊啊）。单次调用是一次本地 SQLite 查询，
+	// 相对后续入库/媒体上传可忽略，不要为了省这一次查询回到「只用 push name」。
+	name := getNickName(ctx, evt.Info.Sender)
 	if name == "" {
-		name = getNickName(ctx, evt.Info.Sender)
+		name = evt.Info.PushName
 	}
 	if name == "" {
 		name = recoverChatID(ctx, evt)
@@ -547,6 +550,15 @@ func processRecoverJob(job *recoverJob) {
 		publishRecover(job.payload(""))
 		return
 	}
+	// 水位只保证「开始下载时还有 200MB+」，挡不住单条大文件把剩余空间吃掉。
+	// 两个用户进程并发下载大视频时，水位可以被叠加穿透 —— 下载前再校验「不得占掉一半剩余空间」。
+	if free, ok := statusFreeDiskBytes("."); !mediaFitsDisk(free, ok, job.size) {
+		log.Warnf("recover %s: media %d bytes exceeds half of free disk (%d), metadata only",
+			job.messageID, job.size, free)
+		job.mediaSkipped = true
+		publishRecover(job.payload(""))
+		return
+	}
 
 	dlCtx, cancel := context.WithTimeout(context.Background(), recoverDownloadTimeout)
 	tmpPath, err := downloadToTemp(dlCtx, job.media, job.messageID)
@@ -573,6 +585,17 @@ func processRecoverJob(job *recoverJob) {
 	}
 
 	publishRecover(job.payload(job.objectKey))
+}
+
+// mediaFitsDisk 判断单个待下载媒体是否能安全落盘：不得占用一半以上剩余空间。
+//
+// 文件大小未知（size=0，个别媒体协议不带 FileLength）或磁盘不可探测
+// （Windows 联调 `statusFreeDiskBytes` 返回 ok=false）时放行，保持既有行为。
+func mediaFitsDisk(free uint64, ok bool, size uint64) bool {
+	if size == 0 || !ok {
+		return true
+	}
+	return size <= free/2
 }
 
 func recoverWaitForDisk(messageID string) bool {

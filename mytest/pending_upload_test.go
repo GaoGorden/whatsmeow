@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -156,5 +157,133 @@ func TestPrunePendingUploadsByBytes(t *testing.T) {
 	}
 	if len(pairs) == 0 {
 		t.Fatalf("prune should keep the newest items, got none")
+	}
+}
+
+// writePendingFixture 直接落一条暂存记录（不经过 save 路径，便于构造指定的 source / mtime）。
+func writePendingFixture(t *testing.T, dir, base string, meta pendingUploadMeta, size int, mtime time.Time) {
+	t.Helper()
+	b, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal meta %s: %v", base, err)
+	}
+	jsonPath := filepath.Join(dir, base+".json")
+	binPath := filepath.Join(dir, base+".bin")
+	if err := os.WriteFile(jsonPath, b, 0600); err != nil {
+		t.Fatalf("write json %s: %v", base, err)
+	}
+	if err := os.WriteFile(binPath, make([]byte, size), 0600); err != nil {
+		t.Fatalf("write bin %s: %v", base, err)
+	}
+	if err := os.Chtimes(jsonPath, mtime, mtime); err != nil {
+		t.Fatalf("chtimes json %s: %v", base, err)
+	}
+	if err := os.Chtimes(binPath, mtime, mtime); err != nil {
+		t.Fatalf("chtimes bin %s: %v", base, err)
+	}
+}
+
+func pendingExists(dir, base string) bool {
+	_, err := os.Stat(filepath.Join(dir, base+".json"))
+	return err == nil
+}
+
+// 淘汰顺序必须是「价值最低先丢」，而不是「最旧先丢」：
+// 最老的 ViewOnce 必须活下来，优先牺牲 Recover 的缓冲消息媒体。
+func TestPrunePendingUploadsByPriority(t *testing.T) {
+	dir := t.TempDir()
+	pendingUploadDir = dir
+	origMax, origBytes := pendingUploadMax, pendingUploadMaxBytes
+	pendingUploadMax, pendingUploadMaxBytes = 4, int64(1<<30)
+	defer func() { pendingUploadMax, pendingUploadMaxBytes = origMax, origBytes }()
+
+	now := time.Now()
+	// ViewOnce 是最老的一条：若只看 mtime 必被淘汰，本用例证明优先级胜过 mtime
+	writePendingFixture(t, dir, "VIEWONCE_OLD", pendingUploadMeta{FileName: "VIEWONCE_OLD"}, 10, now.Add(-10*time.Hour))
+	writePendingFixture(t, dir, "REC_N1", pendingUploadMeta{
+		FileName: "REC_N1", Source: pendingSourceRecover, RecoverEventType: "normal"}, 10, now.Add(-5*time.Hour))
+	writePendingFixture(t, dir, "REC_N2", pendingUploadMeta{
+		FileName: "REC_N2", Source: pendingSourceRecover, RecoverEventType: "normal"}, 10, now.Add(-4*time.Hour))
+	writePendingFixture(t, dir, "REC_N3", pendingUploadMeta{
+		FileName: "REC_N3", Source: pendingSourceRecover, RecoverEventType: "normal"}, 10, now.Add(-3*time.Hour))
+	writePendingFixture(t, dir, "REC_PERM", pendingUploadMeta{
+		FileName: "REC_PERM", Source: pendingSourceRecover, RecoverEventType: "revoke"}, 10, now.Add(-2*time.Hour))
+	writePendingFixture(t, dir, "STATUS1", pendingUploadMeta{
+		FileName: "STATUS1", Source: pendingSourceStatus}, 10, now.Add(-1*time.Hour))
+
+	prunePendingUploads()
+
+	if !pendingExists(dir, "VIEWONCE_OLD") {
+		t.Fatalf("view-once must not be evicted by recover volume")
+	}
+	for _, gone := range []string{"REC_N1", "REC_N2"} {
+		if pendingExists(dir, gone) {
+			t.Fatalf("%s (oldest recover-buffer) should be pruned first", gone)
+		}
+	}
+	for _, keep := range []string{"REC_N3", "REC_PERM", "STATUS1"} {
+		if !pendingExists(dir, keep) {
+			t.Fatalf("%s should be kept", keep)
+		}
+	}
+	if got := len(listPendingPairs()); got != 4 {
+		t.Fatalf("expected 4 items after prune, got %d", got)
+	}
+}
+
+// 只有 ViewOnce 且超过上限时，退回「丢最旧」的既有行为。
+func TestPrunePendingUploadsViewOnceOnlyDropsOldest(t *testing.T) {
+	dir := t.TempDir()
+	pendingUploadDir = dir
+	origMax, origBytes := pendingUploadMax, pendingUploadMaxBytes
+	pendingUploadMax, pendingUploadMaxBytes = 2, int64(1<<30)
+	defer func() { pendingUploadMax, pendingUploadMaxBytes = origMax, origBytes }()
+
+	now := time.Now()
+	for i := 0; i < 4; i++ {
+		base := fmt.Sprintf("VIEW%04d", i)
+		writePendingFixture(t, dir, base, pendingUploadMeta{FileName: base}, 10, now.Add(time.Duration(i)*time.Minute))
+	}
+
+	prunePendingUploads()
+
+	for _, gone := range []string{"VIEW0000", "VIEW0001"} {
+		if pendingExists(dir, gone) {
+			t.Fatalf("%s should be pruned (oldest first)", gone)
+		}
+	}
+	for _, keep := range []string{"VIEW0002", "VIEW0003"} {
+		if !pendingExists(dir, keep) {
+			t.Fatalf("%s should be kept", keep)
+		}
+	}
+}
+
+// 元数据损坏的记录无法重传，应最先被淘汰，且不影响正常记录。
+func TestPrunePendingUploadsDropsCorruptFirst(t *testing.T) {
+	dir := t.TempDir()
+	pendingUploadDir = dir
+	origMax, origBytes := pendingUploadMax, pendingUploadMaxBytes
+	pendingUploadMax, pendingUploadMaxBytes = 2, int64(1<<30)
+	defer func() { pendingUploadMax, pendingUploadMaxBytes = origMax, origBytes }()
+
+	now := time.Now()
+	// 损坏记录最旧 + 最低优先级（无法解析）
+	if err := os.WriteFile(filepath.Join(dir, "BROKEN.json"), []byte("{not-json"), 0600); err != nil {
+		t.Fatalf("write broken json: %v", err)
+	}
+	_ = os.Chtimes(filepath.Join(dir, "BROKEN.json"), now.Add(-10*time.Hour), now.Add(-10*time.Hour))
+	writePendingFixture(t, dir, "VIEWOK1", pendingUploadMeta{FileName: "VIEWOK1"}, 10, now.Add(-2*time.Hour))
+	writePendingFixture(t, dir, "VIEWOK2", pendingUploadMeta{FileName: "VIEWOK2"}, 10, now.Add(-1*time.Hour))
+
+	prunePendingUploads()
+
+	if pendingExists(dir, "BROKEN") {
+		t.Fatalf("corrupt meta should be pruned first")
+	}
+	for _, keep := range []string{"VIEWOK1", "VIEWOK2"} {
+		if !pendingExists(dir, keep) {
+			t.Fatalf("%s should be kept", keep)
+		}
 	}
 }

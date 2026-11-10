@@ -21,8 +21,9 @@ import (
 // Java 掉线导致预签名申请/上传失败时，媒体先暂存于此，Java 重连（attach）后自动重传并通知。
 var pendingUploadDir = "pending-upload"
 
-// pendingUploadMax: 暂存上限（条）。溢出丢最旧并记 ERROR（丢弃意味着该 view-once 无法恢复）。
-const pendingUploadMax = 100
+// pendingUploadMax: 暂存上限（条）。溢出按优先级丢最旧并记 ERROR（丢弃意味着该媒体无法恢复）。
+// 用 var 而非 const：单测要把它调小才能在不写上百个文件的前提下验证淘汰顺序。
+var pendingUploadMax = 100
 
 // pendingUploadMaxBytes: 暂存上限（字节，2GiB）。只看条数挡不住「100 个大视频」——100 × 100MB
 // 就是一个用户的磁盘占用上到 10GB。条数与字节任一超标都触发按 mtime 丢最旧。
@@ -165,34 +166,92 @@ func sanitizeFileName(name string) string {
 	return s
 }
 
-// prunePendingUploads 超过上限（条数或总字节）时按 mtime 丢最旧
-// （记 ERROR：被丢弃的 view-once 无法恢复）。两条上限都要满足才停止淘汰。
-func prunePendingUploads() {
-	pairs := listPendingPairs()
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].mtime.Before(pairs[j].mtime) })
+// 暂存淘汰优先级：**数值小的先被淘汰**。
+//
+// 超限时不能只按 mtime：Recover 是全量单聊、媒体量远大于 ViewOnce/Status，
+// 只按时间淘汰会让它把正在等补传的 ViewOnce 挤出目录 —— 那是永久丢失。
+const (
+	pendingPriRecoverBuffer    = 0 // Recover 普通缓冲消息的媒体（列表不可见，价值最低）
+	pendingPriRecoverPermanent = 1 // Recover 的撤回/编辑/view-once 媒体
+	pendingPriStatus           = 2 // Status 动态
+	pendingPriViewOnce         = 3 // 最后才牺牲
+)
 
+// pendingPriority 读取暂存元数据判定淘汰优先级。
+// 元数据读不出来（损坏/半写入）按最低优先级处理 —— 它本来就无法重传。
+func pendingPriority(jsonPath string) int {
+	b, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return pendingPriRecoverBuffer
+	}
+	var meta pendingUploadMeta
+	if err := json.Unmarshal(b, &meta); err != nil {
+		return pendingPriRecoverBuffer
+	}
+	switch meta.Source {
+	case pendingSourceRecover:
+		if meta.RecoverEventType == "" || meta.RecoverEventType == "normal" {
+			return pendingPriRecoverBuffer
+		}
+		return pendingPriRecoverPermanent
+	case pendingSourceStatus:
+		return pendingPriStatus
+	case "":
+		return pendingPriViewOnce // 兼容旧记录：Source 为空 = view-once
+	default:
+		// 未知来源按中等优先级：既不与 ViewOnce 争最后一名，也不至于最先被丢
+		return pendingPriStatus
+	}
+}
+
+// prunePendingUploads 超过上限（条数或总字节）时裁剪。
+//
+// 淘汰顺序：先牺牲价值最低的媒体，同级内再按 mtime 丢最旧 ——
+//
+//	recover 缓冲消息 < recover 永久事件 < status < view-once
+//
+// 两条上限都要满足才停止淘汰。被丢弃的媒体无法恢复，故记 ERROR（含各档淘汰数）。
+func prunePendingUploads() {
+	type entry struct {
+		p   pendingPair
+		pri int
+	}
+	pairs := listPendingPairs()
+	entries := make([]entry, 0, len(pairs))
 	total := int64(0)
 	for _, p := range pairs {
 		total += p.size
+		entries = append(entries, entry{p: p, pri: pendingPriority(p.json)})
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].pri != entries[j].pri {
+			return entries[i].pri < entries[j].pri
+		}
+		return entries[i].p.mtime.Before(entries[j].p.mtime)
+	})
 
-	kept := len(pairs)
+	kept := len(entries)
 	bytes := total
 	pruned, prunedBytes := 0, int64(0)
-	for _, p := range pairs {
+	prunedByPri := [4]int{}
+	for _, e := range entries {
 		if kept <= pendingUploadMax && bytes <= pendingUploadMaxBytes {
 			break
 		}
-		_ = os.Remove(p.json)
-		_ = os.Remove(p.bin)
+		_ = os.Remove(e.p.json)
+		_ = os.Remove(e.p.bin)
 		kept--
-		bytes -= p.size
+		bytes -= e.p.size
 		pruned++
-		prunedBytes += p.size
+		prunedBytes += e.p.size
+		if e.pri >= 0 && e.pri < len(prunedByPri) {
+			prunedByPri[e.pri]++
+		}
 	}
 	if pruned > 0 {
-		log.Errorf("pending-upload pruned %d oldest items (%d bytes) to respect caps (count %d, bytes %d); now %d items / %d bytes",
-			pruned, prunedBytes, pendingUploadMax, pendingUploadMaxBytes, kept, bytes)
+		log.Errorf("pending-upload pruned %d item(s) (%d bytes) by priority (recover-buffer=%d, recover-permanent=%d, status=%d, view-once=%d); now %d items / %d bytes (caps: %d items, %d bytes)",
+			pruned, prunedBytes, prunedByPri[0], prunedByPri[1], prunedByPri[2], prunedByPri[3],
+			kept, bytes, pendingUploadMax, pendingUploadMaxBytes)
 	}
 }
 
