@@ -156,7 +156,8 @@ WhatsApp 使用 LID（Linked ID）代替真实电话号码，需要反查：
 - 输出 `push name` 和 `phone number`（Java Server 解析为登录成功标记）
 - 解析自己的 LID
 
-- **配对码过期（~160s）**：whatsmeow 二维码耗尽后 WhatsApp 服务器会关闭登录 websocket（`pair-code.go`："160-second time limit"）；登录期 `cli.Store.ID==nil` → `autoReconnect`（client.go:618）直接 return **不重连**，进程保持断开。`handler()` 的 `*events.Disconnected` 分支检测到「登录期断开」（`!cli.IsLoggedIn()`，登录成功后运行期重连不命中）即输出 `MsgPairError`（`pairError`）→ Java 走既有 pairError 分支（ProcessUtils:661）下发 loginTimeout → App 立即显示「配对码已过期，重新发送」，**对齐真实配对码过期时刻**（~160s），而非等 Server 5 分钟 emitter 超时。⚠️ **Phase 2 起是否「真过期」由 Java 按 `code_issued` + `elapsed_ms` 判定**（见下方「配对失败事件处理」）：出码后 <120s 断开改记 `PAIR_NETWORK_DROP`。QR 流程不受影响：`qrchan.go` QR 码耗尽走 `cli.Disconnect()`（预期断开，onDisconnect 不派发 Disconnected），QR 超时仍由 `qrTimeout` 处理。详见 `doc/登录超时与配对码过期对齐方案.md`
+- **配对码过期（~160s / 实测 ~210s）**：whatsmeow 二维码耗尽后 WhatsApp 服务器会关闭登录 websocket（`pair-code.go`："160-second time limit"；2026-11-11 线上实测稳定在 **209.9–210.5s**）；登录期 `cli.Store.ID==nil` → `autoReconnect`（client.go:618）直接 return **不重连**，进程保持断开。`handler()` 的 `*events.Disconnected` 分支检测到「登录期断开」（`!cli.IsLoggedIn()`，登录成功后运行期重连不命中）即输出 `MsgPairError`（`pairError`）→ Java 走既有 pairError 分支（ProcessUtils:661）下发 loginTimeout → App 立即显示「配对码已过期，重新发送」，**对齐真实配对码过期时刻**而非等 Server 5 分钟 emitter 超时。⚠️ **Phase 2 起是否「真过期」由 Java 按 `code_issued` + `elapsed_ms` + `session_age_ms` 判定**（见下方「配对失败事件处理」）。QR 流程不受影响：`qrchan.go` QR 码耗尽走 `cli.Disconnect()`（预期断开，onDisconnect 不派发 Disconnected），QR 超时仍由 `qrTimeout` 处理。详见 `doc/登录超时与配对码过期对齐方案.md`
+- 🔴 **`pair-phone` 在会话老化时先重建 websocket（2026-11-11）**：`pair-phone` 只重置「码龄」（`beginPairAttempt`），**不会**延长 WhatsApp 侧登录 websocket 的寿命 —— 它从 `cli.Connect()` 起算，~210s 固定关闭。Server 的同号重试会在缓存码龄 >150s 时向**旧 socket** 重发 `pair-phone`，于是新码只剩十几秒可用（用户必然输不完），断开时 `elapsed_ms` 又很小 → 被 Java 误判成「出码后网络中断」。现在 `pair-phone` 先查 `loginSessionAge()`，≥ `loginSessionRefreshMs`（默认 **90s**）就 `cli.Disconnect()` + `cli.Connect()` 换一条新 socket 再要码。`Disconnect()` 是预期断开（不派发 `events.Disconnected`），不会多出一条 pairError。会话起点由 `markLoginSessionStart` 记录：**登录期**在 `pair-phone` / `require-qrcode` 各自的 Connect 分支里写（⚠️ 登录期**不派发** `events.Connected` —— `handleConnectSuccess` 对未配对设备直接 return），登录后的重连才由 `events.Connected` 刷新。
 
 ### 5. 命令系统（socket 交互）
 
@@ -409,7 +410,7 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 | `MsgLogoutSuccess` | `logoutSuccess` | 登出确认 |
 | `MsgViewOnceFile` | `viewOnceFile` | 阅后即焚文件通知 |
 | `MsgViewOnceEnabled` | `viewOnceEnabled` | ViewOnce 开关确认 |
-| `MsgPairError` | `pairError` | 配对错误。**Phase 2（2026-10-23）新增结构化字段**：`stage`(`pair_request`/`awaiting_code`/`pair_complete`/`connect`) / `reason`（机器码，如 `pair_hmac_mismatch`、`temp_banned`、`login_disconnected`）/ `status`（HTTP/IQ status 或 ban code 101–106，0 时不发）/ `elapsed_ms`（已出码按出码时刻算，未出码按 `pair-phone` 开始算）/ `code_issued`。🔴 `error` 原文逐字不变（老 Java 只按文本分类；下发给 App 的 SSE 文案仍是 `"pair error"`） |
+| `MsgPairError` | `pairError` | 配对错误。**Phase 2（2026-10-23）新增结构化字段**：`stage`(`pair_request`/`awaiting_code`/`pair_complete`/`connect`) / `reason`（机器码，如 `pair_hmac_mismatch`、`temp_banned`、`login_disconnected`）/ `status`（HTTP/IQ status 或 ban code 101–106，0 时不发）/ `elapsed_ms`（已出码按出码时刻算，未出码按 `pair-phone` 开始算）/ `code_issued` / `session_age_ms`（**2026-11-11 追加**：登录 websocket 从 `Connect` 起的存活毫秒数，未知时不发；Java 用它把「到点关闭」与「刚出码就断网」分开）。🔴 `error` 原文逐字不变（老 Java 只按文本分类；下发给 App 的 SSE 文案仍是 `"pair error"`） |
 | `MsgStatusFile` | `statusFile` | **Status（动态）条目上报**（2026-09-22 新增）：`statusId` / `observerId` / `pushName` / `kind`(text·image·video·audio) / `miniType` / `fileLength` / `seconds` / `text`（文案，产品要求保存）/ `objectKey` / `thumbKey` / `postedAt`。⚠️ **必须走 `PresenceCache.Notify`，不得裸 `ProtoOutput`**——裸输出拿不到掉线缓冲，Java 掉线期间会直接丢。⚠️ `kind` 为媒体但 `objectKey` 为空 = 该条媒体不可用（超 100MB 只报元数据，或磁盘水位降级），App 侧据此渲染 |
 | `MsgRecoverMessage` | `recoverMessage` | **消息恢复事件上报**（2026-11-05 新增）：`ackId` / `messageId` / `chatId` / `chatName` / `senderJid` / `eventType`(normal·revoke·edit·view_once) / `kind` / `text` / `originalText` / `objectKey` / `mime` / `size` / `seconds` / `fileName` / `mediaSkipped` / `postedAt` / `eventAt`。⚠️ 必须走 `PresenceCache.Notify` + `recover-outbox/`；ack 用 `ackId` 而非 messageId |
 | `MsgHeartbeat` | `heartbeat` | 进程心跳（60s 间隔） |
@@ -432,9 +433,13 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
   其它→`pair_completion_failed`。
 - 时间基准由 `pairAttempt`（`beginPairAttempt`/`markPairCodeIssued`/`endPairAttempt`）维护，
   `emitPairError` 用 `reported` 保证**一次尝试只上报一条**；`*events.PairSuccess` 只清状态、不发消息。
-- 登录期 `Disconnected` 现在也带上 `code_issued` + `elapsed_ms`，由 **Java** 用 120s 阈值区分
-  「配对码过期」（`CODE_EXPIRED`）与「出码后网络中断」（`PAIR_NETWORK_DROP`）。
-- 单测：`mytest/pair_failure_test.go`（纯函数 `pairFailureOf` / `elapsedFor`）。
+- 登录期 `Disconnected` 现在也带上 `code_issued` + `elapsed_ms` + `session_age_ms`，由 **Java** 区分
+  「配对码过期」（`CODE_EXPIRED`）与「出码后网络中断」（`PAIR_NETWORK_DROP`）：
+  `elapsed_ms >= 120s` **或** `session_age_ms >= 150s`（会话已过 WhatsApp 的固定关闭时刻）→ 过期；
+  两者都不满足才是网络中断。⚠️ 只看 `elapsed_ms` 会把「Server 在旧 socket 上重发码后到点关闭」
+  误判成网络中断（2026-11-11 线上 3/3 命中）。
+- 单测：`mytest/pair_failure_test.go`（纯函数 `pairFailureOf` / `elapsedFor` / `sessionAgeFor`
+  + 重建阈值约束 `TestLoginSessionRefreshThreshold`）。
 
 **稳定性机制**：
 - **连接用途标记协议**（`startCommandSocket` accept 循环）：首行发 `attach` 的连接才 `setProtoConn + Replay + flushPendingUploads`；命令/探测连接（sendCommand、health checker probe）只喂命令、不设后端、不重放——避免非 attach 连接提前消耗 PresenceCache 缓冲导致事件写进无人读取的 socket 而丢失。⚠️ **部署顺序：Java 先于 Go**（旧 Java + 新 Go 断裂）。见 `doc/Server重启窗口Observer操作与presence重放风险修复.md`

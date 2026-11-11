@@ -145,6 +145,59 @@ func pairElapsed() (int64, bool) {
 		curPairAttempt.codeIssued, time.Now())
 }
 
+// ---------------------------------------------------------------------------
+// 登录 websocket 会话（2026-11-11）
+//
+// 与 pairAttempt 刻意分开：pair-phone 重发只重置「码龄」（codeIssuedAt），**不会**重置
+// WhatsApp 侧登录 websocket 的寿命 —— 后者从 cli.Connect() 起算，线上实测稳定在
+// 209.9–210.5s 被服务器关闭（与用户操作无关；whatsmeow 文档记的 160s 是 QR 耗尽时刻）。
+//
+// 后果：在一条已经活了 150s+ 的 socket 上重发配对码（Server 的 LINK_CODE_TTL_MS=150s
+// 会走这条路），新码只剩十几秒可用 —— 用户必然输不完；断开时 Go 报的 elapsed_ms 又变成
+// 小值，Java 会把「到点关闭」误判成「出码后网络中断」（PAIR_NETWORK_DROP）。
+// 对策两条：① pair-phone 在会话老化时先换一条新 websocket 再要码（见 handleCmd）；
+// ② pairError 带上 session_age_ms，让 Java 能识别「会话已到寿命」。
+// ---------------------------------------------------------------------------
+
+type loginSession struct {
+	mu        sync.Mutex
+	startedAt time.Time
+}
+
+var curLoginSession loginSession
+
+// loginSessionRefreshMs：会话老到这个年龄就重建 websocket 再出码。
+// 取 90s = 服务器关闭时刻（~210s）− 120s（Java 区分「过期 / 网络中断」的阈值）：
+// 重建后新码至少还有 120s 可用，也不可能再落进 PAIR_NETWORK_DROP 分支。
+// 写成 var 便于单测调小。
+var loginSessionRefreshMs int64 = 90_000
+
+func markLoginSessionStart() {
+	curLoginSession.mu.Lock()
+	curLoginSession.startedAt = time.Now()
+	curLoginSession.mu.Unlock()
+}
+
+// loginSessionAge 返回当前登录 websocket 已存活的毫秒数；未知时 ok=false。
+func loginSessionAge() (int64, bool) {
+	curLoginSession.mu.Lock()
+	start := curLoginSession.startedAt
+	curLoginSession.mu.Unlock()
+	return sessionAgeFor(start, time.Now())
+}
+
+// sessionAgeFor 纯函数，便于单测：零值 = 未知；负值（时钟回拨）归零。
+func sessionAgeFor(start, now time.Time) (int64, bool) {
+	if start.IsZero() {
+		return 0, false
+	}
+	ms := now.Sub(start).Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	return ms, true
+}
+
 // emitPairError 输出一条结构化 pairError（一次尝试只发一条）。
 //
 // 🔴 `error` 字段必须保持与旧版**逐字一致**：老 Java 只按文本分类，
@@ -168,6 +221,11 @@ func emitPairError(stage, reason, detail string, status int) {
 		"reason":      reason,
 		"elapsed_ms":  elapsedMs,
 		"code_issued": issued,
+	}
+	// 会话年龄（从 Connect 起算）：与 elapsed_ms 一起告诉 Java「断开时 socket 活了多久」。
+	// 到点关闭（~210s）即使码是刚重发的（elapsed 很小）也不是网络掉线。
+	if sessionAgeMs, ok := loginSessionAge(); ok {
+		payload["session_age_ms"] = sessionAgeMs
 	}
 	if status != 0 {
 		payload["status"] = status
@@ -649,6 +707,18 @@ func handleCmd(cmd string, args []string) {
 			return
 		}
 		beginPairAttempt()
+		// 🔴 会话已老化时先换一条新 websocket 再要码（2026-11-11）：
+		// pair-phone 只重置「码龄」，不重置 WhatsApp 侧 websocket 的寿命（从 Connect 起约 210s）。
+		// 在一条只剩十几秒的 socket 上重发配对码，用户必然输不完，断开还会被 Java 判成
+		// 「出码后网络中断」。Disconnect() 是预期断开，不会派发 events.Disconnected，
+		// 因此不会额外产生一条 pairError。
+		if cli.IsConnected() {
+			if ageMs, ok := loginSessionAge(); ok && ageMs >= loginSessionRefreshMs {
+				log.Infof("Login session is %ds old (limit %ds), reconnecting before issuing a new pairing code",
+					ageMs/1000, loginSessionRefreshMs/1000)
+				cli.Disconnect()
+			}
+		}
 		if !cli.IsConnected() {
 			err := cli.Connect()
 			if err != nil {
@@ -658,6 +728,10 @@ func handleCmd(cmd string, args []string) {
 				emitPairError("pair_request", "connect_failed", err.Error(), 0)
 				return
 			}
+			// Connect 返回时 socket 已建立，同步记下会话起点。
+			// （登录期不会派发 events.Connected —— handleConnectSuccess 对未配对设备直接 return，
+			// 所以这个是配对阶段唯一的会话起点写入点，不能省。）
+			markLoginSessionStart()
 			log.Infof("Client is ready")
 			//time.Sleep(2 * time.Second)
 		}
@@ -707,6 +781,7 @@ func handleCmd(cmd string, args []string) {
 		if err != nil {
 			log.Errorf("Failed to connect: %v", err)
 		} else {
+			markLoginSessionStart()
 			log.Infof("Client is ready")
 		}
 	case "reconnect":
@@ -1731,6 +1806,10 @@ func handler(rawEvt interface{}) {
 			}
 		}
 	case *events.Connected:
+		// ⚠️ 只有**已配对**的连接才会走到这里（connectionevents.handleConnectSuccess 在
+		// !cli.paired 时直接 return），所以它只覆盖登录后的 autoReconnect / 手动重连。
+		// 登录期（配对码 / QR）的会话起点在各自的 Connect 分支里 mark。
+		markLoginSessionStart()
 		if len(cli.Store.PushName) == 0 {
 			return
 		}

@@ -136,3 +136,41 @@ func TestElapsedFor(t *testing.T) {
 		})
 	}
 }
+
+// sessionAgeFor：登录 websocket 已存活多久（pairError.session_age_ms）。
+// Java 用它识别「会话已到 WhatsApp 的固定关闭时刻」——即便码是刚重发的（elapsed 很小），
+// 也不能判成「出码后网络中断」。
+func TestSessionAgeFor(t *testing.T) {
+	now := time.Date(2026, 11, 11, 10, 11, 26, 0, time.UTC)
+
+	cases := []struct {
+		name   string
+		start  time.Time
+		wantMs int64
+		wantOk bool
+	}{
+		{"fresh session after reconnect", now.Add(-16 * time.Second), 16000, true},
+		{"aged session near server close", now.Add(-210 * time.Second), 210000, true},
+		{"unknown start", time.Time{}, 0, false},
+		{"clock skew never returns negative", now.Add(time.Second), 0, true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ms, ok := sessionAgeFor(c.start, now)
+			if ms != c.wantMs || ok != c.wantOk {
+				t.Fatalf("sessionAgeFor = (%d, %v), want (%d, %v)", ms, ok, c.wantMs, c.wantOk)
+			}
+		})
+	}
+}
+
+// 重建阈值必须明显小于 Java 的 120s「过期 / 网络中断」分界：
+// 重建出来的新码要能活过阈值，否则重建本身没有意义。
+func TestLoginSessionRefreshThreshold(t *testing.T) {
+	const javaCodeExpiryThresholdMs = 120_000
+	if loginSessionRefreshMs <= 0 || loginSessionRefreshMs >= javaCodeExpiryThresholdMs {
+		t.Fatalf("loginSessionRefreshMs = %d, want 0 < x < %d",
+			loginSessionRefreshMs, javaCodeExpiryThresholdMs)
+	}
+}
