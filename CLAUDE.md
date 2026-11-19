@@ -151,6 +151,14 @@ WhatsApp 使用 LID（Linked ID）代替真实电话号码，需要反查：
 - **QR 码**：`require-qrcode` 命令 → `cli.GetQRChannel()` → `cli.Connect()` → 输出 QR code
 - **验证码**：`pair-phone <number>` → `cli.PairPhone()` → 输出 linking code
 
+⚠️ **`require-qrcode` 的失败是「静默」的（2026-11-19）**：`cli.Connect()` 失败（实测
+`TLS handshake timeout`）或 `cli.GetQRChannel()` 失败、以及 `cli.IsConnected()` 已连接时，
+现场都只打一行 `[Main ERROR]`/`log.Errorf` 到 **go.log**，**不发任何 proto** —— daemon 模式下
+Java 只读 socket、不读 stdout，所以 Server 根本不知道这次二维码会话已经废了，会把网页端
+一直挂在 `STARTING`。目前靠 Server 侧 30 秒看门狗收尾（见 `doc/RQ-001网页刷新二维码后一直Loading排查记录.md`）；
+若要「失败即时可见」，需要在上述分支补一条 proto（新消息类型或复用 `pairError` 的
+`connect_failure`）并同步 Java 的解析。
+
 登录成功后：
 - 发送 `PresenceAvailable`
 - 输出 `push name` 和 `phone number`（Java Server 解析为登录成功标记）
