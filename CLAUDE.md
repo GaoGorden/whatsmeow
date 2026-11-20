@@ -408,7 +408,7 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 | `MsgReceivedMessage` | `receivedMessage` | 收到消息通知 |
 | `MsgCheckUser` | `checkUser` | 号码检查结果 |
 | `MsgGetAvatar` | `getAvatar` | 头像获取成功 |
-| `MsgGetAvatarFail` | `getAvatarFail` | 头像获取失败 |
+| `MsgGetAvatarFail` | `getAvatarFail` | 头像获取失败。🆕 **2026-11-20 追加 `reason`**：`unauthorized`（对方隐私不允许）/ `not_set`（对方没设头像）/ `timeout`（超时）/ `error`（其它，临时性）。Server 只在**确定性**失败（前两个）时清空已存头像，`timeout`/`error` 保留旧 URL。旧版 Server 忽略该字段，向后兼容 |
 | `MsgLoginSuccess` | `loginSuccess` | 登录成功 |
 | `MsgPushName` | `pushName` | 用户昵称 |
 | `MsgPhoneNumber` | `phoneNumber` | 用户手机号 |
@@ -464,8 +464,11 @@ Go 进程通过 `ProtoOutput()` 函数经 socket 输出 **`##PROTO##` 前缀的 
 whatsmeow 库自身的 `log.Errorf` / `log.Warnf` 输出仍为纯文本行，Java 通过 `line.contains()` / 正则匹配作为回退：
 ```
 [Client/Socket ERROR] reconnecting in background    ← 库自动重连
-[Main ERROR] Failed to get avatar for ...           ← handleCmd 命令失败
 ```
+
+⚠️ **`getavatar` 的失败原因打到 Debug、不进 `[Main ERROR]`**（2026-11-20）：「对方隐藏头像」极常见，
+Error 级别会刷屏。现在 `log.Debugf("Failed to get avatar for %s: %v", ...)`，同时把归并后的
+`reason` 塞进 `getAvatarFail` proto —— 排查看 Server 日志里的 `reason=` 即可（不用开 Go Debug）。
 
 **注意**：`[Main ERROR]` 来自 `handleCmd()` 的命令执行失败（如 getavatar 目标没有头像），Java 端将其视为命令级错误（不触发重启），仅 `[Client*/Database*]` 错误进入重启频率窗口。
 

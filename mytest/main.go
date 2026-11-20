@@ -653,6 +653,30 @@ func parseJID(arg string) (types.JID, bool) {
 	}
 }
 
+// avatarFailReason 把 GetProfilePictureInfo 的错误归成 Server 可消费的短码。
+//
+//	unauthorized —— 对方隐私设置不让你看（确定性：重试也不会成功）
+//	not_set      —— 对方没设头像 / 对你不可见（确定性）
+//	timeout      —— 请求超时（临时性）
+//	error        —— 其它（协议异常、连接抖动；临时性）
+//
+// Server 只在**确定性失败**时清空已存头像；临时性失败保留旧 URL（App 的 Glide 对失效 URL
+// 会自己退回占位图），避免一次网络抖动把一批本来有效的头像抹掉。
+func avatarFailReason(err error) string {
+	switch {
+	case err == nil:
+		return "not_set"
+	case errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized):
+		return "unauthorized"
+	case errors.Is(err, whatsmeow.ErrProfilePictureNotSet):
+		return "not_set"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return "timeout"
+	default:
+		return "error"
+	}
+}
+
 func handleCmd(cmd string, args []string) {
 	ctx := context.Background()
 	switch cmd {
@@ -1251,12 +1275,20 @@ func handleCmd(cmd string, args []string) {
 			ExistingID:  existingID,
 		})
 		if err != nil {
-			//log.Errorf("Failed to get avatar for %s: %v", jid, err)
-			ProtoOutput(MsgGetAvatarFail, map[string]any{"jid": searchPhoneNum(ctx, jid)})
+			// 打到 Debug：对方隐藏头像很常见，Error 级别会刷屏；排查时开 Debug 即可。
+			// proto 里带 reason，Server 据此决定失败时要不要清空已存头像（见 avatarFailReason）。
+			log.Debugf("Failed to get avatar for %s: %v", jid, err)
+			ProtoOutput(MsgGetAvatarFail, map[string]any{
+				"jid":    searchPhoneNum(ctx, jid),
+				"reason": avatarFailReason(err),
+			})
 		} else if pic != nil {
 			ProtoOutput(MsgGetAvatar, map[string]any{"jid": searchPhoneNum(ctx, jid), "url": pic.URL})
 		} else {
-			ProtoOutput(MsgGetAvatarFail, map[string]any{"jid": searchPhoneNum(ctx, jid)})
+			ProtoOutput(MsgGetAvatarFail, map[string]any{
+				"jid":    searchPhoneNum(ctx, jid),
+				"reason": "not_set",
+			})
 		}
 	case "getgroup":
 		if len(args) < 1 {
