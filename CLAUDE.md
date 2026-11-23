@@ -213,11 +213,9 @@ Java Server 通过 Unix socket 向 Go 进程发送命令（Windows 与 Linux 一
 2. **过滤按电话号码**（不是 JID 字符串比对）：比对前统一走 `normalizeStatusJid` 归一化
    （剥 `+` 前缀、去设备号后缀、补 `@s.whatsapp.net`）。**这一步不做就会静默失配**——
    表现为「某些联系人永远收不到动态」，且没有任何报错。
-3. 🔴 ~~**纯文字动态也要保存文案**（产品要求）：`kind=text` 走完全独立的一条早退路径……~~
-   **已作废（2026-09-28 产品要求「不监听也不展示纯文本动态」）**：纯文本现在在 `default:` 分支
-   **直接丢弃、连上报都不做**（原先那条 `publishStatus(job.payload("", ""))` 的早退路径已删除）。
-   原因是它虽然"没有文件、不占资源"，但仍会进 `status_file`、参与未读数与 5 分钟聚合推送，
-   而 App 详情页只能渲染出一行文字卡片 —— 没有任何可看/可下/可分享的内容。
+3. 🔴 **纯文本动态直接丢弃**（2026-09-28 产品要求「不监听也不展示纯文本动态」）：`kind=text`
+   在 `default:` 分支**直接丢弃、连上报都不做**。原因是它会进 `status_file`、参与未读数与
+   5 分钟聚合推送，而 App 详情页只能渲染一行文字卡片，没有任何可看/可下/可分享的内容。
    ⚠️ **带图动态的 caption 不受影响**：图片/视频走各自分支的 `job.text = m.GetCaption()`，
    语音恒空（AudioMessage 没有 caption 字段）。
    ⚠️ 常量 `statusKindText` 保留但已不产出；**存量** `status_file` 里的 `kind='text'` 行由
@@ -516,8 +514,7 @@ cd whatsmeow
 ### 冲突处理
 
 如果合并时出现冲突，脚本会提示手动处理。**库层（`mytest/`、`mytest2/` 之外）的 fork 定制共 5 个文件**，分两类
-（2026-09-23 核对：原写「集中在 3 个文件」并宣称 `store/clientpayload.go`、`types/events/events.go` 与上游完全一致，
-与该节之外的 §0 / `presence.go` 定制记载自相矛盾，且经 `git diff upstream/main` 核对不实）：
+（2026-09-23 经 `git diff upstream/main` 核对）：
 
 **一、改上游既有文件（会冲突，需手动加回）**：
 
