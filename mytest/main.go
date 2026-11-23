@@ -424,6 +424,10 @@ func main() {
 				"shared_mb":   shared,
 				"subscribers": presenceMgr.Count(),
 				"uptime_sec":  time.Since(time.Unix(startupTime, 0)).Seconds(),
+				// LastSeen 健康（2026-11-23）：Java 汇总到 /inner/lastseenHealth，Proxy 据此判断
+				// 采集链路是否还有输入（last_presence_ms 只记实时到达，重放不刷新）。
+				"presence_events":  presenceEvents.Load(),
+				"last_presence_ms": lastPresenceMs.Load(),
 				// Status 采集的可观测指标（方案 §3.7 心跳指标）：
 				// pending = outbox 待 Java 确认条数（长期不降 = Java 没在 ack）；
 				// dropped = 队列背压 + outbox 溢出累计丢弃（>0 即代表有动态永久丢失）；
@@ -2122,6 +2126,9 @@ func handler(rawEvt interface{}) {
 		if presenceMgr.IsUnsubscribed(result) {
 			return
 		}
+		// LastSeen 健康（2026-11-23）：只统计实时到达的事件（缓存重放不走这里）。
+		presenceEvents.Add(1)
+		lastPresenceMs.Store(time.Now().UnixMilli())
 		pe := &presenceEvent{
 			state: "online",
 			jid:   result,
