@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
@@ -100,6 +101,83 @@ func TestRecoverEditedTextAndKind(t *testing.T) {
 	})
 	if text != "new caption" || kind != "image" {
 		t.Fatalf("got (%q, %q), want (\"new caption\", \"image\")", text, kind)
+	}
+}
+
+// Meta AI 等 bot 消息的编辑 payload 包在 botInvokeMessage（FutureProofMessage）里
+// （常见形态 `editedMessage{botInvokeMessage{...}}`）。不解这层会返回 ("", "unknown")，
+// Server 会把一次空编辑落成永久行 —— 2026-11-25 线上：Meta AI 会话整页「无编辑历史」。
+func TestRecoverEditedTextUnwrapsBotInvoke(t *testing.T) {
+	answer := func() *waE2E.Message { return &waE2E.Message{Conversation: proto.String("AI answer")} }
+	cases := []struct {
+		name string
+		msg  *waE2E.Message
+	}{
+		{
+			name: "protocol edit -> botInvoke -> conversation",
+			msg: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+				EditedMessage: &waE2E.Message{BotInvokeMessage: &waE2E.FutureProofMessage{
+					Message: answer(),
+				}},
+			}},
+		},
+		{
+			name: "editedMessage -> botInvoke -> extendedText",
+			msg: &waE2E.Message{EditedMessage: &waE2E.FutureProofMessage{
+				Message: &waE2E.Message{BotInvokeMessage: &waE2E.FutureProofMessage{
+					Message: &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+						Text: proto.String("AI answer"),
+					}},
+				}},
+			}},
+		},
+		{
+			name: "botInvoke -> deviceSent -> conversation",
+			msg: &waE2E.Message{BotInvokeMessage: &waE2E.FutureProofMessage{
+				Message: &waE2E.Message{DeviceSentMessage: &waE2E.DeviceSentMessage{
+					Message: answer(),
+				}},
+			}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			text, kind := recoverEditedTextAndKind(tc.msg)
+			if text != "AI answer" || kind != "text" {
+				t.Fatalf("got (%q, %q), want (\"AI answer\", \"text\")", text, kind)
+			}
+		})
+	}
+}
+
+// bot 会话整类排除：Meta AI 等会以「反复编辑同一条消息」流式输出，每个 chunk 都是一次 edit。
+// Sender 与 Chat 任一命中都要算 —— bot 消息既可能用 @bot，也可能映射到 PN JID。
+func TestRecoverIsBotChat(t *testing.T) {
+	human := types.NewJID("6281234567890", types.DefaultUserServer)
+	botPN := types.NewJID("13135550002", types.DefaultUserServer)
+	botJID := types.NewJID("867051314767696", types.BotServer)
+	cases := []struct {
+		name string
+		evt  *events.Message
+		want bool
+	}{
+		{"human chat", &events.Message{Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Sender: human, Chat: human},
+		}}, false},
+		{"bot PN as sender", &events.Message{Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Sender: botPN, Chat: botPN},
+		}}, true},
+		{"bot server JID as chat", &events.Message{Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Sender: human, Chat: botJID},
+		}}, true},
+		{"nil event", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := recoverIsBotChat(tc.evt); got != tc.want {
+				t.Fatalf("recoverIsBotChat = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

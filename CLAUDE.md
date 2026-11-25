@@ -30,7 +30,7 @@
 | `presence_manager.go` | 联系人订阅管理器（跟踪已订阅 JID，重连后自动重订阅；含退订标记集 `unsubscribedJIDs`，软退订 + 协议退订（`UnsubscribePresence`，**实测无效**，best-effort）双层；`Subscribe` 为**粘性订阅**——断线发送失败也记录 JID，重连后 `ResubscribeAll` 补发；`MarkPriority` **优先重订阅**重加 JID（ResubscribeAll 先发它，避免 map 随机顺序把重加 JID 排到最后拖慢恢复）；重加 observer 靠 2s 无推送强制重连兜底） |
 | `presence_cache.go` | **Presence 事件缓存与重放**：Java 掉线期间缓存上下线通知，重连后按序重放（含 `ts` 时间戳精确还原）；`Notify` 同时缓冲 view-once 等运行时通知；`Remove(jid)` 清空单 JID 缓存（软退订用）；`lastArrival`/`HasFreshEvent` 供重加订阅后 2s 无推送判定（触发强制重连兜底）。详见 `doc/Go端presence事件缓存与重放方案.md`、`doc/Server重启窗口Observer操作与presence重放风险修复.md` |
 | `status.go` | **Status（动态）采集主体**（2026-09-22 新增）：`handleStatusMessage` = 过滤链（总开关 / `IsFromMe` / 纯 SKDM / `ProtocolMessage`(REVOKE) / 号码过滤集 / LRU 去重）→ 类型分派（image/video/audio 走下载上传；**纯文本直接丢弃**，2026-09-28）→ worker 池（并发 2）→ outbox。含 `statusObserverSet`（全量覆盖 `replace`）、`statusSeenSet`（5000 条环形去重）、`normalizeStatusJid`、`statusObjectKey`、磁盘水位暂停。详见 `doc/Status动态追踪_Go端实施记录.md`、方案 `doc/Status动态追踪功能实现方案.md` |
-| `recover.go` | **消息恢复（Recover）采集主体**（2026-11-05 新增）：`handleRecoverMessage` 先分流 `RawMessage` 的 `REVOKE` / `MESSAGE_EDIT`（**必须在通用 `receivedMessage` 之前 return**，否则编辑会被规范化成「原消息 ID + 新内容」覆盖原文），再对普通/视图一次消息按 `recoverClassify` 入队。**全部一对一单聊**采集（群聊 / `status@broadcast` / newsletter 跳过；自己发的不采）。worker=1、队列 256、LRU 去重、`recover-outbox/{ackId}.json` + `recoverack`。ackId = `messageId\|eventType\|eventAt`（同一消息可能有 edit/revoke 多个事件，不能按 messageId ack）。媒体不设上限，只受磁盘水位约束。单测 `recover_test.go` |
+| `recover.go` | **消息恢复（Recover）采集主体**（2026-11-05 新增）：`handleRecoverMessage` 先分流 `RawMessage` 的 `REVOKE` / `MESSAGE_EDIT`（**必须在通用 `receivedMessage` 之前 return**，否则编辑会被规范化成「原消息 ID + 新内容」覆盖原文），再对普通/视图一次消息按 `recoverClassify` 入队。**全部一对一单聊**采集（群聊 / `status@broadcast` / newsletter / bot 会话跳过；自己发的不采）。worker=1、队列 256、LRU 去重、`recover-outbox/{ackId}.json` + `recoverack`。ackId = `messageId\|eventType\|eventAt`（同一消息可能有 edit/revoke 多个事件，不能按 messageId ack）。媒体不设上限，只受磁盘水位约束。单测 `recover_test.go` |
 | `diskfree_linux.go` / `diskfree_other.go` | `statusFreeDiskBytes(path)` 平台分叉（`syscall.Statfs`）。**非 Linux 返回 `ok=false`** → 磁盘水位保护只在生产生效，本地 Windows 联调不会被暂停逻辑卡住（对照 `proc_mem_linux.go` / `proc_mem_other.go`） |
 | `status_test.go` | Status 单测 9 个（过滤链早退、去重集淘汰、outbox 生命周期/裁剪、payload 字段表）。`statusMaxFileBytes` / `statusOutboxMax` 写成 `var` 就是为了单测能调小 |
 | `pending_upload.go` | **View-once 完整恢复**：上传失败（如 Java 掉线致预签名失败）时媒体暂存 `pending-upload/`，attach/周期触发重传 + 补通知，上限 **100 条 + 2GiB**（双上限，任一超标触发裁剪）。🔴 **2026-11-10 起淘汰按优先级而非纯 mtime**：`recover 缓冲消息 < recover 永久事件 < status < view-once`（同级内仍按 mtime 丢最旧）——Recover 的媒体量远大于另外两个功能，只按时间淘汰会把正在等补传的 ViewOnce 挤掉（永久丢失）。元数据损坏的记录按最低优先级最先丢弃。**2026-09-22 流式改造**：下载走 `downloadToTemp`（`cli.DownloadToFile` 落临时文件）、上传走 `uploadFileToS3`、暂存走 `moveFile`（rename 优先），全链路内存 O(32KB) 与文件大小无关。详见 `doc/pending-upload流式改造实施记录.md`、`doc/Go进程内存优化与预签名上传方案.md`「完整恢复」。**同批新增 `Source` 判别字段**：`flushPendingUploads` 按 `meta.Source == "status"` 分流到 `flushPendingStatus`——Status 复用这套暂存目录，就同时复用了条数/字节双上限、rename 搬移与 attach/周期两条重传触发路径；`Source` 为空（含历史遗留记录）走原 view-once 路径。`flushPendingStatus` 用记录里**存下的 `ObjectKey`**（不重新推导，否则重传会落到与 DB 不同的键上）。**2026-11-05 新增 `Source=recover`**：`flushPendingRecover` 走同一套暂存/重传，成功后发 `recoverMessage` |
@@ -270,8 +270,10 @@ outbox 的三个触发点：① 写入在 `publishStatus` 里**先落盘再 Noti
 入口 `recover.go`，与 Status 的成熟件（worker/背压/LRU/磁盘水位/outbox/pending-upload）同构，
 但有四个关键差异：
 
-1. **范围是全量一对一单聊**，不按 observer 过滤；群聊、`status@broadcast`、newsletter 跳过，
-   自己发的不采。`chatId` 用 `searchPhoneNum` 解析（失败才退回 JID 的 user 部分）。
+1. **范围是全量一对一单聊**，不按 observer 过滤；群聊、`status@broadcast`、newsletter
+   **和 bot 会话**跳过，自己发的不采。bot 判定 `recoverIsBotChat`：`Sender` / `Chat`
+   任一 `IsBot()` 命中即排除（Meta AI 等用流式编辑输出，采进来全是 edit 噪音，
+   见下方「bot 会话」条）。`chatId` 用 `searchPhoneNum` 解析（失败才退回 JID 的 user 部分）。
 2. **必须先处理 `ProtocolMessage`**：`REVOKE` 取 `Key.ID`、`MESSAGE_EDIT` 取 `Key.ID` + `EditedMessage`，
    分别发 `eventType=revoke/edit` 并 **return true** 让上层直接返回。若落到通用
    `receivedMessage`，whatsmeow 已把编辑规范化成「原消息 ID + 新内容」，原文会被静默覆盖。
@@ -308,6 +310,13 @@ outbox 的三个触发点：① 写入在 `publishStatus` 里**先落盘再 Noti
   `FileName`(messageId) / `ObjectKey` / `MiniType` / `FileLength` / `Seconds` / `PostedAt`，
   另加 `RecoverAckID/EventType/Kind/Text/FileName/EventAt`。
 - 心跳追加 `recover_enabled` / `recover_pending` / `recover_dropped` / `recover_queue`。
+- 🔴 **bot 会话（Meta AI 等）整类不采集**（2026-11-25 线上）：`recoverIsBotChat` 在入口
+  按 `Sender` / `Chat` 的 `IsBot()` 排除（返回 false，通用 `receivedMessage` 照旧跑）。
+  这类会话用「反复编辑同一条消息」流式输出，每个 chunk 都是一次 edit 事件；原先采进来
+  会落大量空白/重复条目并逐次发 FCM。
+  另：其编辑正文还多一层 `botInvokeMessage`（`editedMessage{botInvokeMessage{...}}`），
+  `recoverUnwrapMessage` 也补解这层（顺带 `LottieStickerMessage`）作为兜底；protocol
+  分支在 unknown 时补了结构 WARN（只打包装形态、不打正文，与 secret 分支同口径）。
 - **部署顺序 Server 先于 Go**：新 Go 配旧 Server 会因收不到 `recoverack` 让 outbox 涨到上限。
 - 单测 `recover_test.go` 覆盖分类、编辑文本、view-once 判定、ackId 唯一性、扩展名推导。
 

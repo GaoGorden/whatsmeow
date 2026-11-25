@@ -85,6 +85,12 @@ func handleRecoverMessage(evt *events.Message) bool {
 	if !recoverEnabled.Load() || evt == nil || evt.Message == nil {
 		return false
 	}
+	// bot 会话（Meta AI 等）整类排除：不采集，也不消费（通用 receivedMessage 照旧跑）。
+	// 依据 2026-11-25 线上：Meta AI 用「反复编辑同一条消息」流式输出，每个 chunk 都是一次
+	// edit 事件 —— 既会落大量条目，也会逐次触发 FCM。
+	if recoverIsBotChat(evt) {
+		return false
+	}
 	// 群聊/自己发的：不采集，但也不能消费——通用 receivedMessage 仍要跑
 	if evt.Info.IsGroup || evt.Info.IsFromMe {
 		return false
@@ -130,6 +136,23 @@ func handleRecoverMessage(evt *events.Message) bool {
 			if originalID != "" {
 				text, kind := recoverEditedTextAndKind(pm.GetEditedMessage())
 				logRecoverEdit("protocol", originalID, kind, text)
+				if text == "" && kind == "unknown" {
+					// 只打结构、不打内容：若仍出现，说明编辑 payload 还有未覆盖的包装。
+					// 2026-11-25 线上实例：Meta AI（bot 会话）的流式编辑包在 botInvokeMessage 里，
+					// 未解这层 → 每次编辑都落一条空白永久行（列表显示「无编辑历史」）。
+					inner := pm.GetEditedMessage()
+					log.Warnf("recover: protocol edit content unknown (message %s, target %s): "+
+						"conv=%d ext=%v image=%v video=%v doc=%v botInvoke=%v lottie=%v edited=%v",
+						evt.Info.ID, originalID,
+						len(inner.GetConversation()),
+						inner.GetExtendedTextMessage() != nil,
+						inner.GetImageMessage() != nil,
+						inner.GetVideoMessage() != nil,
+						inner.GetDocumentMessage() != nil,
+						inner.GetBotInvokeMessage() != nil,
+						inner.GetLottieStickerMessage() != nil,
+						inner.GetEditedMessage() != nil)
+				}
 				ackID := recoverAckID(originalID, "edit", eventAt)
 				if recoverSeen.mark(ackID) {
 					publishRecover(map[string]any{
@@ -303,6 +326,16 @@ func handleRecoverMessage(evt *events.Message) bool {
 	return false
 }
 
+// recoverIsBotChat 判断事件是否属于 bot 会话（Meta AI 等）。
+// Sender 与 Chat 任一命中即可：bot 消息既可能用 bot 服务器 JID，也可能映射到 PN JID
+// （`types.IsBot()` 两种都认），只判一侧会漏。
+func recoverIsBotChat(evt *events.Message) bool {
+	if evt == nil {
+		return false
+	}
+	return evt.Info.Sender.IsBot() || evt.Info.Chat.IsBot()
+}
+
 // recoverIsViewOnce 兼容新旧三种包装与「媒体自身 GetViewOnce()」。
 func recoverIsViewOnce(evt *events.Message) bool {
 	if evt.IsViewOnce || evt.IsViewOnceV2 || evt.IsViewOnceV2Extension {
@@ -361,7 +394,7 @@ func recoverClassify(m *waE2E.Message) (string, whatsmeow.DownloadableMessage, s
 // recoverEditedTextAndKind 从 MESSAGE_EDIT 的新内容里取文本与类型。
 //
 // ⚠️ 编辑内容可能被包在多层 Message 里（ProtocolMessage.EditedMessage /
-// EditedMessage / DeviceSentMessage / Ephemeral / DocumentWithCaption ...）。
+// EditedMessage / DeviceSentMessage / BotInvokeMessage / Ephemeral / DocumentWithCaption ...）。
 // 2026-11-05 实测 `SecretEncryptedMessage(MESSAGE_EDIT)` 解密后的 payload 就不是
 // 直接的 Conversation，必须逐层解开，否则会返回 `("", "unknown")`，
 // Server 把 text_content 覆盖成空串，列表摘要变空白。
@@ -414,10 +447,17 @@ func recoverUnwrapMessage(m *waE2E.Message) *waE2E.Message {
 			m = m.GetEditedMessage().GetMessage()
 		case m.GetDeviceSentMessage().GetMessage() != nil:
 			m = m.GetDeviceSentMessage().GetMessage()
+		// 🔴 bot 会话（Meta AI 等）：消息正文包在 botInvokeMessage（FutureProofMessage）里。
+		// 被编辑时是 `editedMessage{botInvokeMessage{...}}`，不解这层会得到 ("", "unknown")，
+		// Server 会把它当成「无原行的空编辑」插入一条空白永久行（2026-11-25 线上）。
+		case m.GetBotInvokeMessage().GetMessage() != nil:
+			m = m.GetBotInvokeMessage().GetMessage()
 		case m.GetEphemeralMessage().GetMessage() != nil:
 			m = m.GetEphemeralMessage().GetMessage()
 		case m.GetDocumentWithCaptionMessage().GetMessage() != nil:
 			m = m.GetDocumentWithCaptionMessage().GetMessage()
+		case m.GetLottieStickerMessage().GetMessage() != nil:
+			m = m.GetLottieStickerMessage().GetMessage()
 		case m.GetViewOnceMessage().GetMessage() != nil:
 			m = m.GetViewOnceMessage().GetMessage()
 		case m.GetViewOnceMessageV2().GetMessage() != nil:
