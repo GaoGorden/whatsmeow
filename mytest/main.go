@@ -415,13 +415,15 @@ func main() {
 		for range ticker.C {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
-			rss, pss, shared := readProcMem()
+			rss, pss, shared, dirty := readProcMem()
 			ProtoOutput(MsgHeartbeat, map[string]any{
 				"goroutines":  runtime.NumGoroutine(),
 				"mem_mb":      m.Alloc / 1024 / 1024,
 				"rss_mb":      rss,
 				"pss_mb":      pss,
 				"shared_mb":   shared,
+				// 匿名内存（不可回收）：容量估算用它，RSS 会随 page cache 回收在节点间失真
+				"dirty_mb": dirty,
 				"subscribers": presenceMgr.Count(),
 				"uptime_sec":  time.Since(time.Unix(startupTime, 0)).Seconds(),
 				// LastSeen 健康（2026-11-23）：Java 汇总到 /inner/lastseenHealth，Proxy 据此判断

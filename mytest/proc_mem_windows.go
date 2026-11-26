@@ -28,10 +28,10 @@ type processMemoryCounters struct {
 }
 
 // readProcMem 返回进程物理内存（MB）。Windows 用 GetProcessMemoryInfo 取 WorkingSet
-// （= RSS 等价口径，含共享代码段，跨进程重复计数）。Windows 无 PSS/共享页均摊概念，
-// pss/shared 返回 -1（web 显示「—」）。rss 读失败同样返回 -1。
-func readProcMem() (rssMB, pssMB, sharedMB int64) {
-	rssMB, pssMB, sharedMB = -1, -1, -1
+// （= RSS 等价口径，含共享代码段，跨进程重复计数）。Windows 无 PSS/共享页均摊/Private_Dirty
+// 概念，pss/shared/dirty 返回 -1（web 显示「—」，容量估算回落 RSS）。rss 读失败同样返回 -1。
+func readProcMem() (rssMB, pssMB, sharedMB, dirtyMB int64) {
+	rssMB, pssMB, sharedMB, dirtyMB = -1, -1, -1, -1
 	h, _, _ := procGetCurrentProcess.Call()
 	var c processMemoryCounters
 	c.CB = uint32(unsafe.Sizeof(c))

@@ -23,14 +23,15 @@ func parseVmRSS(s string) (int64, bool) {
 	return 0, false
 }
 
-// readProcMem 返回进程物理内存（MB）：rss(驻留含共享，跨进程重复计数)、pss(共享页均摊=真实物理成本)、
-// shared(共享页物理占用)。一次读 /proc/self/smaps_rollup 取 Rss/Pss/Shared_Clean/Shared_Dirty。
+// readProcMem 返回进程内存（MB）：rss(驻留含共享，跨进程重复计数且受 page cache 回收影响)、
+// pss(共享页均摊)、shared(共享页)、dirty(Private_Dirty 匿名内存，不可回收)。
+// 一次读 /proc/self/smaps_rollup；解析逻辑见 parseSmapsRollup（纯函数，有单测）。
 // 不可用（内核<4.14 / 读失败）返回 -1，web 显示「—」。
-func readProcMem() (rssMB, pssMB, sharedMB int64) {
-	rssMB, pssMB, sharedMB = -1, -1, -1
+func readProcMem() (rssMB, pssMB, sharedMB, dirtyMB int64) {
 	data, err := os.ReadFile("/proc/self/smaps_rollup")
 	if err != nil {
-		// 兜底：smaps_rollup 缺失时退回 status 的 VmRSS；PSS/共享仍 -1
+		// 兜底：smaps_rollup 缺失时退回 status 的 VmRSS；PSS/共享/匿名仍 -1
+		rssMB, pssMB, sharedMB, dirtyMB = -1, -1, -1, -1
 		if st, err := os.ReadFile("/proc/self/status"); err == nil {
 			if kb, ok := parseVmRSS(string(st)); ok {
 				rssMB = kb / 1024
@@ -38,29 +39,6 @@ func readProcMem() (rssMB, pssMB, sharedMB int64) {
 		}
 		return
 	}
-	var sharedClean, sharedDirty int64
-	for _, line := range strings.Split(string(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) < 2 {
-			continue
-		}
-		kb, err := strconv.ParseInt(f[1], 10, 64)
-		if err != nil {
-			continue
-		}
-		switch f[0] {
-		case "Rss:":
-			rssMB = kb / 1024
-		case "Pss:":
-			pssMB = kb / 1024
-		case "Shared_Clean:":
-			sharedClean = kb
-		case "Shared_Dirty:":
-			sharedDirty = kb
-		}
-	}
-	if sharedClean >= 0 && sharedDirty >= 0 {
-		sharedMB = (sharedClean + sharedDirty) / 1024
-	}
+	rssMB, pssMB, sharedMB, dirtyMB, _ = parseSmapsRollup(string(data))
 	return
 }
